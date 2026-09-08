@@ -572,6 +572,13 @@ const THINK={
   win:"When the enemy king looks exposed, check forcing moves first — Checks, then Captures, then Threats (C-C-T). A quiet-looking position often hides a knockout."
 };
 
+// how many valuable (>=3) pieces of victimColor does the piece on `sq` attack?
+function countAttacksOnValuable(state,sq,victimColor){ let n=0;
+  for(let t=0;t<64;t++){ const p=state.board[t]; if(p&&colorOf(p)===victimColor&&VAL[p.toLowerCase()]>=3){ if(attackersFrom(state,t,other(victimColor)).includes(sq)) n++; } }
+  return n; }
+function isForkGrab(afterOurMove,grabMove){ if(!grabMove)return false; const victim=other(afterOurMove.turn);
+  const after=makeMove(afterOurMove,grabMove); return countAttacksOnValuable(after,grabMove.to,victim)>=2; }
+
 // Analyse ONE move the user just played (S = position before, M = their move).
 function analyzeUserMove(S,M){
   const S2=makeMove(S,M);
@@ -589,13 +596,16 @@ function analyzeUserMove(S,M){
     res.tag='blunder'; res.category='allowed_mate';
     res.detail="This walks into mate — your opponent plays "+toSan(S2,oppMate)+" and it's checkmate.";
     res.think=THINK.mated; res.betterSan=betterBySearch();
+    res.byPiece = S2.board[oppMate.from]? S2.board[oppMate.from].toLowerCase():null;
     return res;
   }
   const hungDelta = oppGrab.gain - preThreat;
   if(hungDelta>=1.5 && oppGrab.move){
     const hp=S2.board[oppGrab.move.to]; const nm=hp?PIECE_NAME[hp.toLowerCase()]:'piece';
     res.tag=sev(oppGrab.gain); res.category='hung_piece';
-    res.detail="This hangs your "+nm+" on "+sqName(oppGrab.move.to)+". Your opponent plays "+toSan(S2,oppGrab.move)+" and wins it (about "+fmtVal(oppGrab.gain)+").";
+    res.byPiece = S2.board[oppGrab.move.from]? S2.board[oppGrab.move.from].toLowerCase():null;
+    res.fork = isForkGrab(S2,oppGrab.move);
+    res.detail="This hangs your "+nm+" on "+sqName(oppGrab.move.to)+". Your opponent plays "+toSan(S2,oppGrab.move)+(res.fork?" — a fork — ":" ")+"and wins it (about "+fmtVal(oppGrab.gain)+").";
     res.think=THINK.hung; res.betterSan=betterBySearch();
     return res;
   }
@@ -931,6 +941,8 @@ STORE.games=STORE.games||[];
 STORE.username=STORE.username||'';
 STORE.level=(STORE.level==null?3:STORE.level);
 STORE.puzzleStats=STORE.puzzleStats||{solved:0,attempts:0};
+STORE.behavior=STORE.behavior||{moves:[]};      // per-move behaviour log (drives your personal heuristics)
+STORE.training=(STORE.training===undefined?true:STORE.training);
 function persist(){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} if(window.__syncPush)window.__syncPush(); }
 
 /* PGN parsing */
@@ -1045,16 +1057,79 @@ function initTheme(){
 
 <script>
 /* ============================================================
+   BEHAVIOUR ENGINE — aggregate the per-move log into patterns,
+   then generate a small, evolving set of personal heuristics.
+   ============================================================ */
+function behaviourReport(){
+  const moves=(STORE.behavior&&STORE.behavior.moves)||[];
+  const R={total:moves.length,blunders:0,mistakes:0,inacc:0,cats:{},byPiece:{},forks:0,
+    fast:{n:0,bad:0},slow:{n:0,bad:0},phase:{opening:0,middlegame:0,endgame:0},
+    overrides:0,catches:0,hintUsed:0,avgMs:0};
+  let msSum=0,msN=0;
+  for(const m of moves){
+    const bad = m.verdict==='blunder'||m.verdict==='mistake';
+    if(m.verdict==='blunder')R.blunders++; else if(m.verdict==='mistake')R.mistakes++; else if(m.verdict==='inaccuracy')R.inacc++;
+    if(bad && m.category) R.cats[m.category]=(R.cats[m.category]||0)+1;
+    if(bad && m.byPiece) R.byPiece[m.byPiece]=(R.byPiece[m.byPiece]||0)+1;
+    if(bad && m.fork) R.forks++;
+    if(m.ms){ msSum+=m.ms; msN++; const fast=m.ms<4000; (fast?R.fast:R.slow).n++; if(bad)(fast?R.fast:R.slow).bad++; }
+    if(bad && m.phase && R.phase[m.phase]!=null) R.phase[m.phase]++;
+    if(m.override)R.overrides++; if(m.caught)R.catches++; if(m.hint)R.hintUsed++;
+  }
+  R.avgMs=msN?Math.round(msSum/msN):0;
+  R.fastBadRate=R.fast.n?R.fast.bad/R.fast.n:0;
+  R.slowBadRate=R.slow.n?R.slow.bad/R.slow.n:0;
+  R.badRate=R.total?(R.blunders+R.mistakes)/R.total:0;
+  return R;
+}
+const PIECE_PLURAL={n:'knights',b:'bishops',r:'rooks',q:'queens',p:'pawns'};
+function personalRules(){
+  const R=behaviourReport(); const rules=[];
+  if(R.total<6) return rules;
+  const topCat=Object.entries(R.cats).sort((a,b)=>b[1]-a[1])[0];
+  const topPiece=Object.entries(R.byPiece).sort((a,b)=>b[1]-a[1])[0];
+  if(R.fast.n>=5 && R.fastBadRate>=0.25 && R.fastBadRate>R.slowBadRate+0.08)
+    rules.push({score:120+R.fastBadRate*100,id:'slow',title:'Slow down — you blunder when you rush',
+      detail:`${Math.round(R.fastBadRate*100)}% of your moves made in under 4 seconds go wrong, vs ${Math.round(R.slowBadRate*100)}% of your slower moves. Before every move, pause and count to five: is anything of mine hanging?`});
+  if(R.forks>=2 || (topPiece && topPiece[0]==='n' && topPiece[1]>=2))
+    rules.push({score:80+R.forks*8,id:'fork',title:'Watch for forks'+(topPiece&&topPiece[0]==='n'?' — enemy knights especially':''),
+      detail:`Your pieces keep getting caught by forks${topPiece&&topPiece[0]==='n'?' (knights are your worst tormentor)':''}. Before you move, look for enemy knight jumps and checks that hit two of your pieces at once.`});
+  if(topCat){ const c=topCat[0];
+    if(c==='hung_piece') rules.push({score:100,id:'hang',title:'Check every move for hanging pieces',detail:'This is your #1 leak. Before you release a move, look at the piece you moved and the square it lands on — count enemy attackers vs your defenders. Then scan: did moving it uncover another piece?'});
+    else if(c==='allowed_mate') rules.push({score:110,id:'mate',title:'Guard your king first',detail:'You are getting mated. After every enemy move, look at your king and the squares next to it (and f2/f7). Deal with any check or mate threat before your own plan.'});
+    else if(c==='missed_material') rules.push({score:75,id:'grab',title:'Grab free material',detail:'You leave free pieces on the board. Every move, scan each enemy piece: is any undefended and reachable? Take it before anything fancy.'});
+    else if(c==='missed_mate') rules.push({score:75,id:'finish',title:'Finish the game — look for the knockout',detail:'When the enemy king is exposed, check every forcing move: Checks, then Captures, then Threats. You are missing wins.'});
+  }
+  if(R.overrides>=3 && R.overrides>R.catches)
+    rules.push({score:60,id:'listen',title:'When the coach stops you, actually re-look',detail:`You have played through the blunder-check warning ${R.overrides} times. Next time it stops you, don't just replay the move — find the threat first, then decide.`});
+  if(R.hintUsed>=5 && R.hintUsed>R.total*0.4)
+    rules.push({score:40,id:'own',title:'Find it yourself before the hint',detail:'You lean on hints a lot. Give yourself 20 seconds to find the idea first — the struggle is where the skill actually forms.'});
+  rules.sort((a,b)=>b.score-a.score);
+  return rules.slice(0,5);
+}
+function gateQuestion(cat,fork){
+  if(cat==='allowed_mate') return "This lets your opponent checkmate you. Look at your king — which escape square is missing, and what check can't you answer?";
+  if(cat==='missed_material') return "Hold on — is there an enemy piece you can simply take for free? This move passes it up. Scan every enemy piece for one that's undefended.";
+  if(cat==='missed_mate') return "Wait — there may be a checkmate available right now. Look at every check you have before you play something quieter.";
+  return "This lets your opponent win material. Look at the piece you're moving and the square it lands on: count their attackers vs your defenders — are you really safe?"+(fork?" And watch for a fork: one enemy piece hitting two of yours.":"");
+}
+/* end:behaviour */
+</script>
+
+<script>
+/* ============================================================
    PLAY & COACH  — the flagship. Play the bot; the coach reacts
    to every move: names the opening, assesses, flags mistakes,
    teaches the thinking, and offers a take-back to try again.
    ============================================================ */
 const play={ state:newGame(), youAre:'w', level:STORE.level, history:[], sans:[],
-  selected:null, hints:[], lastMove:null, over:false, status:'', lastAnn:null, thinking:false, retryFrom:null };
+  selected:null, hints:[], lastMove:null, over:false, status:'', lastAnn:null, thinking:false, retryFrom:null,
+  training:STORE.training!==false, pendingBlunder:null, awaitingCatch:null, hintLevel:0, moveStart:null };
 
 function newPlayGame(youAre,level){
   play.state=newGame(); play.youAre=youAre; play.level=level; play.history=[]; play.sans=[];
   play.selected=null; play.hints=[]; play.lastMove=null; play.over=false; play.status=''; play.lastAnn=null; play.thinking=false; play.retryFrom=null;
+  play.pendingBlunder=null; play.awaitingCatch=null; play.hintLevel=0; play.moveStart=null;
   STORE.level=level; persist();
   drawPlay();
   if(play.youAre==='b') setTimeout(botMove,350); // bot is White, moves first
@@ -1063,12 +1138,15 @@ function RENDER_play(){
   const P=$('panel-play');
   P.innerHTML=`
    <div class="section-h"><h2>Play &amp; coach</h2>
-     <p>Make a move — the coach reacts to every one. It names the opening you're in, tells you who's better and what to watch, and if you slip it shows the mistake and how to think next time. Lose a piece? Hit <b>take it back</b> and try the position again.</p></div>
+     <p>This works on your <em>thinking</em>, not just the board. With <b>Blunder-check</b> on, the coach stops you the moment before a blunder and asks a question — so <em>you</em> catch it, not the engine. The 💡 hint gives a nudge first and the answer only last. Every move is logged, and your mistakes become a personal, evolving checklist in <b>Your game</b>.</p></div>
    <div class="row" style="margin-bottom:14px;gap:14px">
      <div class="field"><label>Play as</label>
        <div class="row" id="colorPick"></div></div>
      <div class="field"><label>Opponent strength</label>
        <select class="txt" id="levelPick"></select></div>
+     <div class="field"><label>Coaching mode</label>
+       <label style="display:flex;align-items:center;gap:7px;font-size:13.5px;padding:7px 0;cursor:pointer">
+         <input type="checkbox" id="trainToggle" style="width:16px;height:16px;accent-color:var(--accent)"> Blunder-check (stop me before I hang)</label></div>
      <div class="field"><label>&nbsp;</label><button class="btn primary" id="newGameBtn">New game</button></div>
    </div>
    <div class="review-grid">
@@ -1094,6 +1172,8 @@ function RENDER_play(){
   const lp=$('levelPick');
   LEVELS.forEach((L,i)=>{ const o=el('option',null,L.name+(i===0?' (easiest)':i===LEVELS.length-1?' (hardest)':'')); o.value=i; if(i===play.level)o.selected=true; lp.appendChild(o); });
   lp.addEventListener('change',()=>{ play.level=+lp.value; STORE.level=play.level; persist(); });
+  const tt=$('trainToggle'); tt.checked=play.training;
+  tt.addEventListener('change',()=>{ play.training=tt.checked; STORE.training=tt.checked; persist(); play.pendingBlunder=null; drawPlay(); });
   $('newGameBtn').addEventListener('click',()=>{ newPlayGame(play.youAre,+lp.value); });
   $('pFlip').addEventListener('click',()=>{ play.youAre=other(play.youAre); drawPlay(); });
   $('pUndo').addEventListener('click',undoPlay);
@@ -1106,6 +1186,7 @@ RENDER.play=RENDER_play;
 function drawPlay(){
   const mount=$('playBoard'); if(!mount)return;
   const humanTurn = !play.over && play.state.turn===play.youAre && !play.thinking;
+  if(humanTurn && !play.moveStart) play.moveStart=Date.now(); // start the think-timer for this move
   renderBoard(mount,play.state,{orient:play.youAre,selectable:humanTurn,selected:play.selected,
     hints:play.hints,lastMove:play.lastMove,onSquare:onPlaySquare});
   // status line
@@ -1117,6 +1198,7 @@ function drawPlay(){
 }
 function onPlaySquare(sq){
   if(play.over||play.thinking||play.state.turn!==play.youAre) return;
+  if(play.pendingBlunder){ play.awaitingCatch=play.pendingBlunder.ann.category; play.pendingBlunder=null; } // any interaction = reconsidering
   const p=play.state.board[sq];
   if(play.selected===null){
     if(p && colorOf(p)===play.youAre){ play.selected=sq; play.hints=legalMoves(play.state).filter(m=>m.from===sq).map(m=>m.to); drawPlay(); }
@@ -1125,20 +1207,41 @@ function onPlaySquare(sq){
   if(sq===play.selected){ play.selected=null; play.hints=[]; drawPlay(); return; }
   if(p && colorOf(p)===play.youAre){ play.selected=sq; play.hints=legalMoves(play.state).filter(m=>m.from===sq).map(m=>m.to); drawPlay(); return; }
   const cands=legalMoves(play.state).filter(m=>m.from===play.selected && m.to===sq);
-  if(cands.length){ const m=cands.find(x=>x.promo==='q')||cands[0]; doUserMove(m); }
+  if(cands.length){ const m=cands.find(x=>x.promo==='q')||cands[0]; attemptMove(m); }
   else { play.selected=null; play.hints=[]; drawPlay(); }
 }
-function doUserMove(m){
+// In Blunder-check mode a blunder/mistake is intercepted with a QUESTION (not the
+// answer) so you do the thinking yourself — that's what actually builds the habit.
+function attemptMove(m){
   const before=play.state;
   const ann=analyzeUserMove(before,m);
+  const ms=play.moveStart? Date.now()-play.moveStart : 0;
+  if(play.training && (ann.tag==='blunder'||ann.tag==='mistake')){
+    play.pendingBlunder={move:m,ann,before,ms}; play.selected=null; play.hints=[]; drawPlay(); return;
+  }
+  const caught=!!play.awaitingCatch; play.awaitingCatch=null;
+  commitMove(before,m,ann,ms,false,caught);
+}
+function commitMove(before,m,ann,ms,override,caught){
+  logBehaviour(before,m,ann,ms,override,caught);
   const san=toSan(before,m);
   play.history.push({state:before,move:m,san});
-  play.sans.push(san.replace(/[+#]/,''));
+  play.sans.push(san.replace(/[*+#]/,''));
   play.state=makeMove(before,m); play.lastMove={from:m.from,to:m.to}; play.selected=null; play.hints=[]; play.lastAnn=ann;
   play.retryFrom=(ann.tag==='blunder'||ann.tag==='mistake')? before : null;
+  play.pendingBlunder=null; play.hintLevel=0; play.moveStart=null;
   const end=checkEnd();
   drawPlay();
   if(!end && !play.over){ play.thinking=true; drawPlay(); setTimeout(botMove,420); }
+}
+function phaseOf(s){ let n=0; for(const p of s.board) if(p)n++; if(play.sans.length<16) return 'opening'; return n<=12?'endgame':'middlegame'; }
+function logBehaviour(before,m,ann,ms,override,caught){
+  const rec={ t:Date.now(), no:Math.floor(play.sans.length/2)+1, san:toSan(before,m).replace(/[*+#]/,''),
+    verdict:ann.tag||'ok', category:ann.category||null, ms:ms||0, phase:phaseOf(before),
+    byPiece:ann.byPiece||null, fork:!!ann.fork, hint:play.hintLevel||0, override:!!override, caught:!!caught };
+  STORE.behavior.moves.push(rec);
+  if(STORE.behavior.moves.length>800) STORE.behavior.moves=STORE.behavior.moves.slice(-800);
+  persist();
 }
 function botMove(){
   if(play.over){ play.thinking=false; return; }
@@ -1168,13 +1271,28 @@ function undoPlay(){
   if(play.history.length){ const last=play.history.pop(); play.sans.pop(); play.state=last.state; }
   play.lastMove = play.history.length? {from:play.history[play.history.length-1].move.from,to:play.history[play.history.length-1].move.to}:null;
   play.over=false; play.status=''; play.lastAnn=null; play.selected=null; play.hints=[]; play.retryFrom=null;
+  play.pendingBlunder=null; play.awaitingCatch=null; play.hintLevel=0; play.moveStart=null;
   drawPlay();
 }
+// Tiered hint: a nudge first, then the area, only then the move — so you still do the work.
 function playHint(){
   if(play.over||play.thinking||play.state.turn!==play.youAre)return;
-  const r=searchRanked(play.state,2,true); if(!r.length)return;
-  const m=r[0].m; play.selected=m.from; play.hints=[m.to];
-  play.status='Hint: try moving the '+PIECE_NAME[play.state.board[m.from].toLowerCase()]+' from '+sqName(m.from)+'.';
+  play.pendingBlunder=null;
+  play.hintLevel=Math.min(3,(play.hintLevel||0)+1);
+  const r=searchRanked(play.state,2,true); if(!r.length)return; const m=r[0].m;
+  const grab=sideBestGrab(play.state), mate=hasMateIn1(play.state), threat=sideBestGrab(flipTurn(play.state));
+  if(play.hintLevel===1){
+    play.status = mate? 'Hint 1 of 3: there is a checkmate here — look at every check you have.'
+      : threat.gain>=2? 'Hint 1 of 3: defend first — your opponent is threatening to win material. Find what.'
+      : grab.gain>=2? 'Hint 1 of 3: there is free material to win — scan for an undefended enemy piece.'
+      : 'Hint 1 of 3: nothing forcing — develop a piece, castle, or improve your worst-placed piece.';
+  } else if(play.hintLevel===2){
+    play.selected=m.from; play.hints=[];
+    play.status='Hint 2 of 3: look hard at your '+PIECE_NAME[play.state.board[m.from].toLowerCase()]+' on '+sqName(m.from)+'. What can it do?';
+  } else {
+    play.selected=m.from; play.hints=[m.to];
+    play.status='Hint 3 of 3: the move is '+toSan(play.state,m)+'.';
+  }
   drawPlay();
 }
 function savePlayed(kind){
@@ -1203,6 +1321,25 @@ function drawCoach(){
   const humanNext = !play.over && play.state.turn===play.youAre;
   const assess = play.sans.length? assessPosition(play.state,play.youAre) : null;
   let html='';
+  // decision gate — the moment-of-decision intervention
+  if(play.pendingBlunder){ const pb=play.pendingBlunder;
+    html+=`<div class="card pad" style="border:1.5px solid var(--mistake);background:var(--mistake-soft);margin-bottom:14px">
+      <div style="display:flex;gap:9px;align-items:center;margin-bottom:6px"><span style="font-size:20px">✋</span>
+        <b style="font-family:var(--display);font-size:17px">Hold on — before you play ${esc(toSan(pb.before,pb.move))}</b></div>
+      <div style="font-size:14px">${esc(gateQuestion(pb.ann.category,pb.ann.fork))}</div>
+      <div class="row" style="margin-top:12px;gap:8px">
+        <button class="btn primary" id="gateLook">I'll look again</button>
+        <button class="btn" id="gatePlay">Play it anyway</button></div>
+      <div class="muted small" style="margin-top:8px">Spot it yourself, then click a different move — or take it back. (Turn this off with “Blunder-check” above.)</div></div>`;
+  }
+  // your rule to focus on (evolves from your behaviour log)
+  const _rules=personalRules();
+  if(!play.pendingBlunder && _rules.length){
+    html+=`<div class="card pad" style="margin-bottom:14px;border-left:4px solid var(--accent)">
+      <div class="eyebrow" style="color:var(--accent-2)">Your rule to focus on</div>
+      <div style="font-weight:600;margin-top:4px">${esc(_rules[0].title)}</div>
+      <div class="muted small" style="margin-top:3px">${esc(_rules[0].detail)}</div></div>`;
+  }
   // opening chip
   html+=`<div class="card pad" style="margin-bottom:14px">
     <div class="eyebrow">Opening radar</div>
@@ -1239,13 +1376,15 @@ function drawCoach(){
     html+=`<div class="notice"><span class="dot">▸</span><span>Tip: open with <b>1.e4</b> or <b>1.d4</b>, then develop knights and bishops toward the center and castle. The coach will name whatever opening you fall into.</span></div>`;
   }
   // always-on: what to think about right now
-  if(humanNext){ const tip=nextPlanTip(play.state,play.youAre);
+  if(humanNext && !play.pendingBlunder){ const tip=nextPlanTip(play.state,play.youAre);
     if(tip) html+=`<div class="notice" style="margin-top:12px"><span class="dot">▸</span><span><b>Your move:</b> ${esc(tip)}</span></div>`; }
   if(play.over){
     html+=`<div class="verdict ${play.status.includes('win')?'right':play.status.includes('draw')||play.status.includes('Stalemate')?'':'wrong'}" style="margin-top:14px">
       <b>${esc(play.status)}</b><div class="small muted" style="margin-top:6px">This game was saved to <b>Your game</b> and its mistakes were added to <b>Puzzles</b>. Hit <b>New game</b> to go again.</div></div>`;
   }
   col.innerHTML=html;
+  const gl=$('gateLook'); if(gl) gl.addEventListener('click',()=>{ const pb=play.pendingBlunder; if(pb)play.awaitingCatch=pb.ann.category; play.pendingBlunder=null; play.selected=null; play.hints=[]; drawPlay(); });
+  const gp=$('gatePlay'); if(gp) gp.addEventListener('click',()=>{ const pb=play.pendingBlunder; if(!pb)return; play.pendingBlunder=null; play.awaitingCatch=null; commitMove(pb.before,pb.move,pb.ann,pb.ms,true,false); });
   const rb=$('retryBtn'); if(rb) rb.addEventListener('click',()=>{
     if(!play.retryFrom)return;
     // roll back to the position before the blunder, same side to move (you)
@@ -1581,6 +1720,27 @@ function RENDER_profile(){
      <div class="tile"><div class="n tnum">${A.n?(Math.round(A.blunders/A.n*10)/10):0}</div><div class="lb">Blunders / game</div></div>
      <div class="tile"><div class="n tnum">${castleRate}%</div><div class="lb">Games you castled</div><div class="sub">${avgFirst?('1st blunder ~move '+avgFirst):''}</div></div>
    </div>`;
+  // ---- per-move behaviour + personal rules (the live coaching loop) ----
+  const BR=behaviourReport(); const rules=personalRules();
+  html+=`<h3 style="margin:8px 0 10px;font-size:18px">Your rules — built from how you actually play</h3>`;
+  if(BR.total<6){
+    html+=`<div class="notice" style="margin-bottom:20px"><span class="dot">▸</span><span>Play some moves in <b>Play &amp; coach</b> with <b>Blunder-check</b> on. After a handful of moves this fills with a personalised, evolving checklist based on the exact mistakes you make — and it updates as those mistakes stop.</span></div>`;
+  } else {
+    html+=`<div class="stack" style="margin-bottom:16px">`+rules.map((r,i)=>
+      `<div class="leak"><div class="rank">${i+1}</div><div><h3>${esc(r.title)}</h3><div class="why">${esc(r.detail)}</div></div></div>`).join('')+`</div>`;
+    const rush=BR.fast.n?Math.round(BR.fastBadRate*100):0, slowR=BR.slow.n?Math.round(BR.slowBadRate*100):0;
+    html+=`<div class="grid-tiles" style="margin-bottom:16px">
+      <div class="tile"><div class="n tnum">${BR.total}</div><div class="lb">Moves logged</div></div>
+      <div class="tile"><div class="n tnum">${(BR.avgMs/1000).toFixed(1)}s</div><div class="lb">Avg time / move</div><div class="sub">think longer, blunder less</div></div>
+      <div class="tile"><div class="n tnum">${rush}%</div><div class="lb">Rushed moves gone wrong</div><div class="sub">vs ${slowR}% when you took time</div></div>
+      <div class="tile"><div class="n tnum">${BR.catches}</div><div class="lb">Blunders you caught yourself</div><div class="sub">at the blunder-check gate</div></div>
+    </div>`;
+    html+=`<div class="card pad" style="margin-bottom:20px"><div class="small" style="line-height:1.7">
+      <div>▸ When the coach stopped you, you <b>found a better move ${BR.catches}×</b> and <b>played it anyway ${BR.overrides}×</b>. ${BR.catches>=BR.overrides?'That self-correction is exactly the habit forming — keep it up.':'Try to actually re-look when it stops you, instead of pushing the move through.'}</div>
+      ${BR.hintUsed?`<div style="margin-top:5px">▸ You leaned on hints on ${BR.hintUsed} move${BR.hintUsed===1?'':'s'} — try to find the idea first.</div>`:''}
+      <div style="margin-top:5px">▸ You go wrong most in the ${(['opening','middlegame','endgame'].sort((a,b)=>BR.phase[b]-BR.phase[a])[0])} (${['opening','middlegame','endgame'].map(p=>p+': '+BR.phase[p]).join(', ')}).</div>
+    </div></div>`;
+  }
   // leaks
   html+=`<h3 style="margin:6px 0 10px;font-size:18px">Your top leaks — fix these in order</h3>`;
   if(!leaks.length){ html+=`<div class="notice"><span class="dot">▸</span><span>No clear blunders detected yet — play a few more games so the coach can spot your patterns.</span></div>`; }
@@ -1606,7 +1766,7 @@ function RENDER_profile(){
   if(!isExample) html+=`<div style="margin-top:18px"><button class="btn ghost" id="clearData">Clear my saved games &amp; stats</button></div>`;
   P.innerHTML=html;
   P.querySelectorAll('[data-drill]').forEach(b=>b.addEventListener('click',()=>{ puz.filter=b.dataset.drill; switchTab('puzzles'); applyPuzFilter(b.dataset.drill); }));
-  const cd=$('clearData'); if(cd)cd.addEventListener('click',()=>{ if(confirm('Delete all saved games and stats? This cannot be undone.')){ STORE.games=[]; STORE.puzzleStats={solved:0,attempts:0}; persist(); RENDER_profile(); } });
+  const cd=$('clearData'); if(cd)cd.addEventListener('click',()=>{ if(confirm('Delete all saved games, stats, and your behaviour log? This cannot be undone.')){ STORE.games=[]; STORE.puzzleStats={solved:0,attempts:0}; STORE.behavior={moves:[]}; persist(); RENDER_profile(); } });
 }
 RENDER.profile=RENDER_profile;
 /* end:profile */
@@ -1663,11 +1823,14 @@ function setSyncBadge(state){ const b=$('syncBadge'); if(!b)return;
   else if(state==='syncing'){ b.textContent='☁ syncing…'; b.style.color='var(--ink-2)'; }
   else { b.textContent='● this device'; b.style.color='var(--ink-3)'; b.title='Saved on this device only. Open the published app on your account to sync across phone and laptop.'; }
 }
-function snapshotState(){ return {games:STORE.games,username:STORE.username,level:STORE.level,theme:STORE.theme||'system',puzzleStats:STORE.puzzleStats,ts:Date.now()}; }
+function snapshotState(){ return {games:STORE.games,username:STORE.username,level:STORE.level,theme:STORE.theme||'system',puzzleStats:STORE.puzzleStats,behavior:STORE.behavior,ts:Date.now()}; }
 function mergeRemote(r){ if(!r)return false; let changed=false;
   const seen=new Set(STORE.games.map(g=>g.pgn));
   for(const g of (r.games||[])){ if(g&&g.pgn&&!seen.has(g.pgn)){ STORE.games.push(g); seen.add(g.pgn); changed=true; } }
   if(STORE.games.length>300) STORE.games=STORE.games.slice(-300);
+  if(r.behavior && Array.isArray(r.behavior.moves)){ const ts=new Set((STORE.behavior.moves||[]).map(m=>m.t));
+    for(const mv of r.behavior.moves){ if(mv&&!ts.has(mv.t)){ STORE.behavior.moves.push(mv); ts.add(mv.t); changed=true; } }
+    STORE.behavior.moves.sort((a,b)=>a.t-b.t); if(STORE.behavior.moves.length>800) STORE.behavior.moves=STORE.behavior.moves.slice(-800); }
   if(r.puzzleStats && (r.puzzleStats.solved||0)>(STORE.puzzleStats.solved||0)){ STORE.puzzleStats=r.puzzleStats; changed=true; }
   if(r.username && !STORE.username){ STORE.username=r.username; changed=true; }
   if(changed){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} }

@@ -6,7 +6,12 @@ A pocket chess coach for beginners, built to take you from "can't get past 300" 
 
 ## What it does
 
-- **Play & coach** — Play a built-in bot (six strength levels, from beatable-beginner to a depth-4 search that finds forced mates). The coach comments on **every** move — not just your mistakes — and after each one you get:
+- **Play & coach** — Play a built-in bot (six strength levels, from beatable-beginner to a depth-4 search that finds forced mates). The point is to change how you *think*, not to do the thinking for you:
+  - **Blunder-check (decision gate):** the moment before you play a blunder or a mistake, the coach stops you and asks a *question* — "count the attackers and defenders on that square", "look at your king" — without revealing the move. You either spot it yourself and play something better (logged as a *catch*), or push it through (logged as an *override*).
+  - **Tiered hint:** the 💡 gives a category nudge first, then the area, and only then the move — so you still do the work.
+  - **A personal, evolving rulebook:** every move is logged (what you played, the verdict, how long you took, which enemy piece punished you, whether it was a fork). Those patterns become a short, ranked checklist of *your* rules — "Slow down, you blunder when you rush", "Watch for enemy knight forks" — shown right next to the board and in **Your game**, updating as your mistakes change.
+
+  On top of that, after each move you still get:
   - the **opening / variation** you're in, named live ("Italian Game, Giuoco Piano"…),
   - a plain-English **position assessment** — who's ahead and *why*, your development, whether your king is safe, and **what your opponent is threatening right now**,
   - a **"your move" tip** telling you what to think about next (castle now, grab the free piece, meet the threat…),
