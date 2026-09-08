@@ -1,7 +1,7 @@
 <title>Pawn Coach</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;450;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;450;500;600&family=Noto+Sans+Symbols+2&display=swap" rel="stylesheet">
 <style>
 :root{
   --bg:#eaeee4; --surface:#ffffff; --surface-2:#f4f7ee; --raise:#fbfcf7;
@@ -101,9 +101,10 @@ button{font-family:var(--sans)}
 .sq.last::after{content:"";position:absolute;inset:0;background:var(--sq-last);opacity:.5}
 .sq.hint::before{content:"";position:absolute;width:30%;height:30%;border-radius:50%;background:var(--sq-hint);z-index:2}
 .sq.hint.cap::before{width:82%;height:82%;background:none;border:5px solid var(--sq-hint);border-radius:50%}
-.sq .pc{font-size:calc(var(--sz)/11);line-height:1;z-index:3;cursor:default;position:relative}
-.pc.w{color:#f7f4e7;-webkit-text-stroke:1.5px #23261d;text-shadow:0 1.5px 1px rgba(0,0,0,.35)}
-.pc.b{color:#26231b;-webkit-text-stroke:1.4px #e7e3cf;text-shadow:0 1.5px 1px rgba(0,0,0,.28)}
+.sq .pc{font-family:"Noto Sans Symbols 2","Segoe UI Symbol","Apple Symbols",sans-serif;
+  font-size:calc(var(--sz)/8.6);line-height:1;z-index:3;cursor:default;position:relative}
+.pc.w{color:#faf7ee;text-shadow:-1px -1px 0 #33302a,1px -1px 0 #33302a,-1px 1px 0 #33302a,1px 1px 0 #33302a,0 2px 2px rgba(0,0,0,.32)}
+.pc.b{color:#242019;text-shadow:-1px -1px 0 #e9e3d1,1px -1px 0 #e9e3d1,-1px 1px 0 #e9e3d1,1px 1px 0 #e9e3d1,0 2px 2px rgba(0,0,0,.26)}
 .coord{position:absolute;font-family:var(--mono);font-size:9.5px;font-weight:600;opacity:.72;z-index:1}
 .coord.file{right:3px;bottom:1px} .coord.rank{left:2px;top:1px}
 .sq.l .coord{color:var(--sq-dark)} .sq.d .coord{color:var(--sq-light)}
@@ -225,6 +226,7 @@ input.txt{border:1px solid var(--line);border-radius:9px;background:var(--surfac
       <span class="tag">Play, and a coach watches every move: it names the opening you're in, catches the mistake, and shows you how to think — not just the engine's move. Built to take you from beginner toward mastery. 100% offline — no downloads, no accounts, no API.</span>
     </div>
     <span class="spacer"></span>
+    <span id="syncBadge" class="mono" style="font-size:11px;color:var(--ink-3);white-space:nowrap"></span>
     <button class="theme-btn" id="themeBtn" title="Toggle light / dark" aria-label="Toggle theme">◐</button>
   </header>
 
@@ -486,21 +488,25 @@ const PST={
      20,20,0,0,0,0,20,20, 20,30,10,0,0,10,30,20]
 };
 function evaluate(s){ // centipawns, White POV
-  let e=0; const b=s.board;
+  let e=0; const b=s.board; let wB=0,bB=0; const wP=[0,0,0,0,0,0,0,0],bP=[0,0,0,0,0,0,0,0];
   for(let sq=0;sq<64;sq++){ const p=b[sq]; if(!p)continue;
     const t=p.toLowerCase(), w=colorOf(p)==='w';
     const idx = w? sq : (7-rOf(sq))*8+fOf(sq);
-    const val = VALc[t] + PST[t][idx];
-    e += w? val : -val;
+    e += (w?1:-1)*(VALc[t] + PST[t][idx]);
+    if(t==='b'){ w?wB++:bB++; } else if(t==='p'){ w?wP[fOf(sq)]++:bP[fOf(sq)]++; }
   }
+  if(wB>=2)e+=30; if(bB>=2)e-=30;                                   // bishop pair
+  for(let f=0;f<8;f++){ if(wP[f]>1)e-=12*(wP[f]-1); if(bP[f]>1)e+=12*(bP[f]-1); } // doubled pawns
   return e;
 }
 function sideEval(s){ const e=evaluate(s); return s.turn==='w'? e : -e; }
 function orderMoves(ms){ return ms.slice().sort((a,b)=>((b.captured?VALc[b.captured.toLowerCase()]:0)-(a.captured?VALc[a.captured.toLowerCase()]:0))); }
 function negamax(s,depth,alpha,beta,useQ){
   const moves=legalMoves(s);
-  if(moves.length===0) return inCheck(s,s.turn)? -(99000+depth) : 0;
-  if(depth===0) return useQ? quies(s,alpha,beta) : sideEval(s);
+  const chk=inCheck(s,s.turn);
+  if(moves.length===0) return chk? -(99000+depth) : 0;
+  if(chk && depth<7) depth++;                       // check extension: don't miss forced tactics
+  if(depth<=0) return useQ? quies(s,alpha,beta) : sideEval(s);
   let best=-1e9;
   for(const m of orderMoves(moves)){ const sc=-negamax(makeMove(s,m),depth-1,-beta,-alpha,useQ);
     if(sc>best)best=sc; if(best>alpha)alpha=best; if(alpha>=beta)break; }
@@ -519,11 +525,12 @@ function searchRanked(s,depth,useQ){
   return scored;
 }
 const LEVELS=[
-  {name:'Beginner', depth:1, q:false, blunder:0.50, slop:200},
-  {name:'Casual',   depth:1, q:false, blunder:0.28, slop:130},
-  {name:'Improver', depth:2, q:false, blunder:0.15, slop:90},
-  {name:'Club',     depth:2, q:true,  blunder:0.05, slop:45},
-  {name:'Sharp',    depth:3, q:true,  blunder:0.0,  slop:20}
+  {name:'Beginner', depth:1, q:false, blunder:0.45, slop:170},
+  {name:'Casual',   depth:2, q:false, blunder:0.22, slop:110},
+  {name:'Improver', depth:2, q:true,  blunder:0.10, slop:70},
+  {name:'Club',     depth:3, q:true,  blunder:0.03, slop:35},
+  {name:'Strong',   depth:3, q:true,  blunder:0.0,  slop:12},
+  {name:'Sharp',    depth:4, q:true,  blunder:0.0,  slop:0}
 ];
 function chooseBotMove(s,levelIdx){
   const L=LEVELS[Math.max(0,Math.min(LEVELS.length-1,levelIdx))];
@@ -645,6 +652,39 @@ function assessPosition(s,userColor){
     threatText: oppMate? ("Careful — your opponent is threatening mate with "+toSan(threatState,oppMate)+".")
       : (oppThreat.gain>=1.5 && oppThreat.move? ("Your opponent is threatening "+toSan(threatState,oppThreat.move)+", winning your "+PIECE_NAME[(threatState.board[oppThreat.move.to]||'p').toLowerCase()]+".")
       : "No immediate threats against you — a good moment to improve your worst-placed piece.")};
+}
+// Plain-language description of a non-mistake move (so every move gets feedback).
+function describeMove(before,m){
+  if(m.flags.includes('k')||m.flags.includes('q')) return "Castled — your king is tucked away safely. That's one of the most important moves in any game.";
+  if(givesMate(before,m)) return "Checkmate — game over. Nicely finished.";
+  const t=m.piece.toLowerCase();
+  const backR = colorOf(m.piece)==='w'?7:6;
+  if(m.captured){ const s2=makeMove(before,m); const loss=seeMax(s2,m.to);
+    if(loss<=VAL[m.piece.toLowerCase()]-0.5||loss===0) return "You win the "+PIECE_NAME[(m.captured||'p').toLowerCase()]+" — clean, it's not defended enough to fight back."; }
+  if(makeMoveGivesCheck(before,m)) return "A check — forcing moves are good, but make sure it actually leads somewhere and doesn't just chase the king to safety.";
+  if((t==='n'||t==='b') && rOf(m.from)===backR) return "Develops your "+PIECE_NAME[t]+" off the back rank. Keep getting pieces out and toward the center.";
+  const cen=new Set([nameToSq('d4'),nameToSq('e4'),nameToSq('d5'),nameToSq('e5')]);
+  if(t==='p' && cen.has(m.to)) return "Stakes a claim in the center — good. Central pawns give your pieces more room.";
+  if(t==='q' && rOf(m.from)===backR) return "Bringing the queen out early is risky — every piece your opponent develops can attack her and gain time. Usually develop knights and bishops first.";
+  if(t==='r') return "A rook move — rooks are happiest on open files (no pawns) where they hit into the enemy position.";
+  return "A reasonable move. When nothing's forcing, ask: is my worst piece doing a job, and is my king safe?";
+}
+// What to think about on THIS move (state.turn is the side to play).
+function nextPlanTip(s,youAre){
+  if(s.turn!==youAre) return null;
+  const legal=legalMoves(s);
+  const kSq=kingSq(s,youAre); const castled = kSq>=0 && (fOf(kSq)>=6||fOf(kSq)<=2);
+  if(!castled && legal.some(m=>m.flags.includes('k')||m.flags.includes('q'))) return "You can castle right now — do it. King safety before anything ambitious.";
+  const grab=sideBestGrab(s);
+  if(grab.gain>=2 && grab.move) return "There may be free material here — scan every enemy piece and ask which are undefended. (Hint: look near "+sqName(grab.move.to)+".)";
+  const mate=hasMateIn1(s);
+  if(mate) return "Look hard for a knockout — there's a checkmate available if you find the right check.";
+  const threat = sideBestGrab(flipTurn(s));
+  if(threat.gain>=2 && threat.move) return "Careful — your opponent is eyeing your "+PIECE_NAME[(flipTurn(s).board[threat.move.to]||'p').toLowerCase()]+" on "+sqName(threat.move.to)+". Defend it or move it before you attack.";
+  let dev=0; const back=youAre==='w'?7:6;
+  for(let sq=0;sq<64;sq++){ const p=s.board[sq]; if(p&&colorOf(p)===youAre&&'nb'.includes(p.toLowerCase())&&rOf(sq)!==back)dev++; }
+  if(dev<4 && !castled) return "Keep developing — get every knight and bishop into the game and castle. Don't start an attack down a piece in development.";
+  return "No forcing moves? Improve your worst-placed piece, put a rook on an open file, or find a target to build pressure on.";
 }
 /* end:analysis */
 </script>
@@ -889,9 +929,9 @@ let STORE={};
 try{ STORE=JSON.parse(localStorage.getItem(KEY))||{}; }catch(e){ STORE={}; }
 STORE.games=STORE.games||[];
 STORE.username=STORE.username||'';
-STORE.level=(STORE.level==null?1:STORE.level);
+STORE.level=(STORE.level==null?3:STORE.level);
 STORE.puzzleStats=STORE.puzzleStats||{solved:0,attempts:0};
-function persist(){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} }
+function persist(){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} if(window.__syncPush)window.__syncPush(); }
 
 /* PGN parsing */
 function parsePGN(pgn){
@@ -1178,22 +1218,29 @@ function drawCoach(){
     </div>`;
   }
   html+=`</div>`;
-  // last-move feedback
+  // last-move feedback — every move gets a comment
   const a=play.lastAnn;
+  const lastUser=[...play.history].reverse().find(h=>!h.bot);
   if(a && (a.tag==='blunder'||a.tag==='mistake'||a.tag==='inaccuracy')){
     html+=`<div class="annot" style="border-left:4px solid var(--${a.tag})">
       <div class="head"><span class="chip ${a.tag}">${a.tag.toUpperCase()}</span>
-        <span class="movetxt">${esc(play.history.filter(h=>!h.bot).slice(-1)[0]?.san||'')}</span></div>
+        <span class="movetxt">${esc(lastUser?lastUser.san:'')}</span></div>
       <div class="body">${esc(a.detail)}</div>
       ${a.betterSan?`<div class="fix">Better was <b>${esc(a.betterSan)}</b>.</div>`:''}
       ${a.think?`<div class="fix" style="border-top:none;padding-top:4px"><span class="muted">How to think:</span> ${esc(a.think)}</div>`:''}
       ${play.retryFrom?`<div style="margin-top:10px"><button class="btn primary" id="retryBtn">↶ Take it back &amp; try again</button></div>`:''}
     </div>`;
-  } else if(a && a.tag==='good'){
-    html+=`<div class="annot" style="border-left:4px solid var(--good)"><div class="head"><span class="chip good">GOOD</span></div><div class="body">${esc(a.detail)}</div></div>`;
-  } else if(!play.sans.length){
+  } else if(lastUser){
+    const good = a && a.tag==='good';
+    html+=`<div class="annot" style="border-left:4px solid var(--${good?'good':'info'})">
+      <div class="head"><span class="chip ${good?'good':'info'}">${good?'GOOD':'MOVE'}</span><span class="movetxt">${esc(lastUser.san)}</span></div>
+      <div class="body">${esc(describeMove(lastUser.state,lastUser.move))}</div></div>`;
+  } else {
     html+=`<div class="notice"><span class="dot">▸</span><span>Tip: open with <b>1.e4</b> or <b>1.d4</b>, then develop knights and bishops toward the center and castle. The coach will name whatever opening you fall into.</span></div>`;
   }
+  // always-on: what to think about right now
+  if(humanNext){ const tip=nextPlanTip(play.state,play.youAre);
+    if(tip) html+=`<div class="notice" style="margin-top:12px"><span class="dot">▸</span><span><b>Your move:</b> ${esc(tip)}</span></div>`; }
   if(play.over){
     html+=`<div class="verdict ${play.status.includes('win')?'right':play.status.includes('draw')||play.status.includes('Stalemate')?'':'wrong'}" style="margin-top:14px">
       <b>${esc(play.status)}</b><div class="small muted" style="margin-top:6px">This game was saved to <b>Your game</b> and its mistakes were added to <b>Puzzles</b>. Hit <b>New game</b> to go again.</div></div>`;
@@ -1609,9 +1656,47 @@ function RENDER_learn(){
 }
 RENDER.learn=RENDER_learn;
 
+/* ---- cross-device sync: artifact db when published, localStorage otherwise ---- */
+let DB_DOC=null, syncTimer=null;
+function setSyncBadge(state){ const b=$('syncBadge'); if(!b)return;
+  if(state==='synced'){ b.textContent='☁ synced'; b.style.color='var(--accent-2)'; b.title='Your games and progress sync across every device where you open this on your account.'; }
+  else if(state==='syncing'){ b.textContent='☁ syncing…'; b.style.color='var(--ink-2)'; }
+  else { b.textContent='● this device'; b.style.color='var(--ink-3)'; b.title='Saved on this device only. Open the published app on your account to sync across phone and laptop.'; }
+}
+function snapshotState(){ return {games:STORE.games,username:STORE.username,level:STORE.level,theme:STORE.theme||'system',puzzleStats:STORE.puzzleStats,ts:Date.now()}; }
+function mergeRemote(r){ if(!r)return false; let changed=false;
+  const seen=new Set(STORE.games.map(g=>g.pgn));
+  for(const g of (r.games||[])){ if(g&&g.pgn&&!seen.has(g.pgn)){ STORE.games.push(g); seen.add(g.pgn); changed=true; } }
+  if(STORE.games.length>300) STORE.games=STORE.games.slice(-300);
+  if(r.puzzleStats && (r.puzzleStats.solved||0)>(STORE.puzzleStats.solved||0)){ STORE.puzzleStats=r.puzzleStats; changed=true; }
+  if(r.username && !STORE.username){ STORE.username=r.username; changed=true; }
+  if(changed){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} }
+  return changed;
+}
+window.__syncPush=function(){ if(!DB_DOC)return; setSyncBadge('syncing');
+  clearTimeout(syncTimer); syncTimer=setTimeout(async()=>{ try{ await DB_DOC.set(snapshotState()); setSyncBadge('synced'); }catch(e){ setSyncBadge('this device'); } },700); };
+async function initSync(){
+  setSyncBadge('this device');
+  try{
+    if(!(window.claude && claude.use)) return;
+    const db=await claude.use('db'); if(!db) return;
+    DB_DOC=db.doc('app/state');
+    const snap=await DB_DOC.get();
+    if(snap && snap.exists) mergeRemote(snap.data());
+    await DB_DOC.set(snapshotState());
+    setSyncBadge('synced');
+    const t=document.querySelector('.tab[aria-selected="true"]'); if(t&&RENDER[t.dataset.tab]) RENDER[t.dataset.tab]();
+    DB_DOC.onSnapshot(s=>{ if(s&&s.exists){ const ch=mergeRemote(s.data());
+      const tab=document.querySelector('.tab[aria-selected="true"]');
+      if(ch && tab && ['profile','puzzles'].includes(tab.dataset.tab) && RENDER[tab.dataset.tab]) RENDER[tab.dataset.tab](); } },
+      ()=>setSyncBadge('this device'));
+  }catch(e){ setSyncBadge('this device'); }
+}
+
 /* ---- boot ---- */
 initTheme();
 initTabs();
 RENDER_play();
+initSync();
 /* end:boot */
 </script>

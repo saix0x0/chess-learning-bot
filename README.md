@@ -6,9 +6,10 @@ A pocket chess coach for beginners, built to take you from "can't get past 300" 
 
 ## What it does
 
-- **Play & coach** — Play a built-in bot (five strength levels, from beatable-beginner to sharp). After every move you get:
+- **Play & coach** — Play a built-in bot (six strength levels, from beatable-beginner to a depth-4 search that finds forced mates). The coach comments on **every** move — not just your mistakes — and after each one you get:
   - the **opening / variation** you're in, named live ("Italian Game, Giuoco Piano"…),
   - a plain-English **position assessment** — who's ahead and *why*, your development, whether your king is safe, and **what your opponent is threatening right now**,
+  - a **"your move" tip** telling you what to think about next (castle now, grab the free piece, meet the threat…),
   - if you blunder: the mistake, the **better move**, and the **thinking habit** that would have caught it — plus a one-click **"take it back & try again."**
 - **Puzzles** — A drill deck built from mini-games, engine-verified tactics, and — the good part — **your own real mistakes** from games you play and import. Every puzzle is correct by construction.
 - **Openings by the book** — An interactive opening book that teaches the *idea* behind each move (not 20 moves of memorization), plus a starter repertoire and a dictionary of named openings so you know them all by name.
@@ -23,7 +24,11 @@ A pocket chess coach for beginners, built to take you from "can't get past 300" 
 3. Lost a piece? Read the coach, hit **take it back**, and play the position better.
 4. To feed it your real games: on chess.com open a finished game → **⋯ → Download** (or your profile → Games → Download) to copy the PGN, then paste it in **Review**. Your mistakes flow into **Puzzles** and **Your game** automatically.
 
-Your games and stats are saved in your browser's `localStorage` — private to your device.
+## Sync across your devices
+
+Open the **published version** on your Claude account (phone *and* laptop) and your games, puzzle progress, and stats **sync automatically** across them — powered by the artifact's private per-account storage, still with no API keys and no third-party service. A small badge in the corner shows `☁ synced` when it's on, or `● this device` when you're running the raw file offline.
+
+When you open `index.html` directly (offline, or from this repo), everything still works and saves to your browser's `localStorage` — private to that device.
 
 ## The engine
 
