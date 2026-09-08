@@ -232,7 +232,7 @@ input.txt{border:1px solid var(--line);border-radius:9px;background:var(--surfac
 
   <nav class="tabs" role="tablist" id="tabs">
     <button class="tab" role="tab" data-tab="play" aria-selected="true">Play &amp; coach</button>
-    <button class="tab" role="tab" data-tab="puzzles">Puzzles</button>
+    <button class="tab" role="tab" data-tab="puzzles">Train</button>
     <button class="tab" role="tab" data-tab="openings">Openings</button>
     <button class="tab" role="tab" data-tab="review">Review a game</button>
     <button class="tab" role="tab" data-tab="profile">Your game</button>
@@ -952,6 +952,7 @@ STORE.behavior=STORE.behavior||{moves:[]};      // per-move behaviour log (drive
 STORE.training=(STORE.training===undefined?true:STORE.training);
 STORE.adaptiveLevel=(STORE.adaptiveLevel==null?2:STORE.adaptiveLevel); // float, auto-tunes to your results
 STORE.puzzleFails=STORE.puzzleFails||{};        // fens you've missed, to resurface
+STORE.srs=STORE.srs||{};                         // fen -> correct-streak (spaced repetition; retire at 2)
 function persist(){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} if(window.__syncPush)window.__syncPush(); }
 
 /* PGN parsing */
@@ -1498,15 +1499,14 @@ const PUZ_PROMPT={
   allowed_mate:s=>`You're about to be mated. Find the move that survives.`
 };
 const PUZ_FILTERS=[['all','All'],['hung_piece','Don\'t hang'],['missed_material','Win material'],['missed_mate','Mates'],['allowed_mate','Survive'],['find_best','Tactics']];
-const puz={ pool:[], view:[], i:0, filter:'all', state:null, cur:null, selected:null, hints:[], solved:false, tried:false, revealed:false, lastMove:null };
+const puz={ pool:[], view:[], i:0, filter:'all', state:null, cur:null, selected:null, hints:[], solved:false, tried:false, revealed:false, lastMove:null, streak:0, best:0 };
 
-function RENDER_puzzles(){
+function renderTactics(){
   puz.pool=buildPuzzlePool();
   applyPuzFilter(puz.filter,true);
-  const P=$('panel-puzzles');
+  const P=$('trainBody'); if(!P)return;
   P.innerHTML=`
-   <div class="section-h"><h2>Puzzles</h2>
-     <p>Every position here is real: it's a spot where someone (a mini-game, a classic tactic, or <em>you</em>) had a clear best move. Solve it on the board. The more you play and import, the more this deck fills with <b>your own</b> mistakes to fix.</p></div>
+   <p class="muted small" style="margin:2px 0 12px;max-width:64ch">Real positions where there's a clear best move — from classic tactics, the mini-games, and <b>your own</b> games. Ones you miss come back until you've nailed them (spaced repetition), and your current weakness is served first.</p>
    <div class="deckbar" id="puzFilters"></div>
    <div class="deckbar"><span class="progress" id="puzProg"></span>
      <span class="spacer" style="flex:1"></span>
@@ -1524,18 +1524,17 @@ function RENDER_puzzles(){
   $('puzSkip').addEventListener('click',()=>{ puz.i=(puz.i+1)%Math.max(1,puz.view.length); loadPuzzle(); });
   loadPuzzle();
 }
-RENDER.puzzles=RENDER_puzzles;
 function applyPuzFilter(v,silent){
   puz.filter=v;
   puz.view = v==='all'? puz.pool.slice() : puz.pool.filter(p=>p.category===v);
   // shuffle for variety
   for(let i=puz.view.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [puz.view[i],puz.view[j]]=[puz.view[j],puz.view[i]]; }
-  // adaptive weighting: put positions you've failed, and your current weakness, first
-  if(v==='all'){ const leak=PROFILE&&PROFILE.leak;
-    puz.view.forEach(p=>p._pri=(STORE.puzzleFails[p.fen]?2:0)+(leak&&p.category===leak?1:0)+Math.random()*0.4);
-    puz.view.sort((a,b)=>b._pri-a._pri); }
+  // adaptive + spaced-repetition weighting: failed & not-yet-mastered & your weakness first, mastered sink
+  const leak=PROFILE&&PROFILE.leak;
+  puz.view.forEach(p=>p._pri=(STORE.puzzleFails[p.fen]?2:0)+((STORE.srs[p.fen]||0)>=2?-3:1.2)+(leak&&p.category===leak?1:0)+Math.random()*0.5);
+  puz.view.sort((a,b)=>b._pri-a._pri);
   puz.i=0;
-  if(!silent){ RENDER_puzzles(); }
+  if(!silent){ renderTactics(); }
 }
 function loadPuzzle(){
   const mount=$('puzBoard'); if(!mount)return;
@@ -1548,7 +1547,7 @@ function drawPuzzle(){
   const side=puz.state.turn;
   const active=!puz.solved && !puz.revealed;
   renderBoard(mount,puz.state,{orient:side,selectable:active,selected:puz.selected,hints:puz.hints,lastMove:puz.lastMove,onSquare:onPuzSquare});
-  $('puzProg').textContent=`Puzzle ${puz.i+1} / ${puz.view.length}  ·  solved ${STORE.puzzleStats.solved}`;
+  $('puzProg').textContent=`Puzzle ${puz.i+1} / ${puz.view.length}  ·  streak ${puz.streak} (best ${puz.best})  ·  solved ${STORE.puzzleStats.solved}`;
   $('puzTheme').textContent=puz.cur.theme? ('Theme: '+puz.cur.theme) : (puz.cur.title||'');
   const prompt=(PUZ_PROMPT[puz.cur.category]||PUZ_PROMPT.find_best)(side);
   let html=`<div class="card pad"><div class="eyebrow">${esc(puz.cur.title||'Puzzle')}</div>
@@ -1578,8 +1577,10 @@ function onPuzSquare(sq){
   const m=cands.find(x=>x.promo==='q')||cands[0];
   const ok=checkPuzzle(puz.cur.fen,puz.cur.category,puz.cur.solutionSan,m);
   STORE.puzzleStats.attempts++;
-  if(ok){ STORE.puzzleStats.solved++; puz.solved=true; puz.lastMove={from:m.from,to:m.to}; puz.state=makeMove(puz.state,m); delete STORE.puzzleFails[puz.cur.fen]; }
-  else { puz.tried=true; STORE.puzzleFails[puz.cur.fen]=1; }
+  if(ok){ STORE.puzzleStats.solved++; puz.solved=true; puz.lastMove={from:m.from,to:m.to}; puz.state=makeMove(puz.state,m);
+    delete STORE.puzzleFails[puz.cur.fen]; STORE.srs[puz.cur.fen]=(STORE.srs[puz.cur.fen]||0)+1;
+    puz.streak++; puz.best=Math.max(puz.best,puz.streak); }
+  else { puz.tried=true; STORE.puzzleFails[puz.cur.fen]=1; STORE.srs[puz.cur.fen]=0; puz.streak=0; }
   persist();
   puz.selected=null; puz.hints=[];
   drawPuzzle();
@@ -1587,6 +1588,209 @@ function onPuzSquare(sq){
 function revealPuzzle(){ if(!puz.cur)return; puz.revealed=true; const m=moveFromSan(puz.state,puz.cur.solutionSan);
   if(m){ puz.lastMove={from:m.from,to:m.to}; puz.state=makeMove(puz.state,m); } drawPuzzle(); }
 /* end:puzzles */
+</script>
+
+<script>
+/* ============================================================
+   TRAIN HUB — the tactics gauntlet plus dedicated drill modes.
+   Every mode is engine-verified, so it can't train you wrong.
+   ============================================================ */
+const train={mode:'tactics'};
+const TRAIN_MODES=[['tactics','Tactics'],['donthang','Don\'t hang'],['mate','Checkmate'],['endgame','Endgames'],['openings','Openings']];
+function RENDER_train(){
+  const P=$('panel-puzzles');
+  P.innerHTML=`<div class="section-h"><h2>Train</h2>
+     <p>Deliberate practice, not busywork. Each mode drills one skill to mastery, and every position is checked by the engine — so you're never taught the wrong thing. Your misses come back until they're fixed.</p></div>
+   <div class="deckbar" id="trainModes"></div><div id="trainBody"></div>`;
+  const mb=$('trainModes');
+  TRAIN_MODES.forEach(([v,l])=>{ const b=el('button','pill',l); if(train.mode===v)b.style.borderColor='var(--accent)';
+    b.addEventListener('click',()=>{ train.mode=v; RENDER_train(); }); mb.appendChild(b); });
+  ({tactics:renderTactics,donthang:renderDontHang,mate:renderCheckmate,endgame:renderEndgame,openings:renderOpeningTrainer}[train.mode])();
+}
+RENDER.puzzles=RENDER_train;
+
+const kingsAdj=(a,b)=>Math.abs(rOf(a)-rOf(b))<=1 && Math.abs(fOf(a)-fOf(b))<=1;
+
+/* ---- Don't-hang generator (infinite reps of the core habit) ---- */
+const dh={state:null,orient:'w',sel:null,hints:[],streak:0,best:0,done:false,ok:false,msg:'',last:null};
+function dhNew(){
+  for(let t=0;t<60;t++){ let s=newGame(); const plies=6+((Math.random()*18)|0); let good=true;
+    for(let i=0;i<plies;i++){ const l=legalMoves(s); if(!l.length){good=false;break;} const m=chooseBotMove(s,0); if(!m){good=false;break;} s=makeMove(s,m); }
+    if(!good||legalMoves(s).length===0) continue;
+    if(!legalMoves(s).some(m=>sideBestGrab(makeMove(s,m)).gain<1.5)) continue;
+    dh.state=s; dh.orient=s.turn; dh.sel=null; dh.hints=[]; dh.done=false; dh.msg=''; dh.last=null; drawDontHang(); return; }
+  dh.state=newGame(); dh.orient='w'; dh.done=false; dh.sel=null; dh.hints=[]; drawDontHang();
+}
+function renderDontHang(){ const P=$('trainBody'); if(!P)return;
+  P.innerHTML=`<p class="muted small" style="margin:2px 0 12px;max-width:64ch">The habit that wins the most games under 800: never leave a piece hanging. Fresh position every time — just make a move that <b>doesn't let your opponent win material</b>. Instant feedback, build a streak.</p>
+   <div class="deckbar"><span class="progress" id="dhProg"></span><span style="flex:1"></span><button class="btn" id="dhNewBtn">New position ▸</button></div>
+   <div class="drill-grid"><div><div class="board-wrap" id="dhBoard"></div><div class="side-label" id="dhStatus"></div></div><div id="dhSide"></div></div>`;
+  $('dhNewBtn').addEventListener('click',dhNew);
+  if(!dh.state) dhNew(); else drawDontHang();
+}
+function drawDontHang(){ const mount=$('dhBoard'); if(!mount)return; const side=dh.orient;
+  renderBoard(mount,dh.state,{orient:side,selectable:!dh.done,selected:dh.sel,hints:dh.hints,lastMove:dh.last,onSquare:dhClick});
+  $('dhProg').textContent=`Streak ${dh.streak} · best ${dh.best}`;
+  $('dhStatus').textContent = dh.done?(dh.ok?'Safe ✓':'Hung! ✗'):((side==='w'?'White':'Black')+' to move.');
+  let h=`<div class="card pad"><div class="eyebrow">Don't hang</div>
+    <div style="font-size:15px;margin-top:6px">${side==='w'?'White':'Black'} to move — play a move that keeps everything defended (your opponent can't win material next).</div>`;
+  if(dh.done) h+=`<div class="verdict ${dh.ok?'right':'wrong'}" style="margin-top:12px"><b>${dh.ok?'Safe — nothing hangs. ✓':'That hangs material. ✗'}</b><div class="small" style="margin-top:6px">${esc(dh.msg)}</div></div><div style="margin-top:12px"><button class="btn primary" id="dhNextBtn">Next ▸</button></div>`;
+  else h+=`<div class="muted small" style="margin-top:10px">Before you move, ask: what can my opponent capture in reply?</div>`;
+  h+=`</div>`; $('dhSide').innerHTML=h; const n=$('dhNextBtn'); if(n)n.addEventListener('click',dhNew);
+}
+function dhClick(sq){ if(dh.done)return; const st=dh.state,side=st.turn,p=st.board[sq];
+  if(dh.sel===null){ if(p&&colorOf(p)===side){ dh.sel=sq; dh.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to); drawDontHang(); } return; }
+  if(sq===dh.sel){ dh.sel=null;dh.hints=[];drawDontHang();return; }
+  if(p&&colorOf(p)===side){ dh.sel=sq; dh.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to); drawDontHang(); return; }
+  const cands=legalMoves(st).filter(m=>m.from===dh.sel&&m.to===sq); if(!cands.length){ dh.sel=null;dh.hints=[];drawDontHang();return; }
+  const m=cands.find(x=>x.promo==='q')||cands[0]; const after=makeMove(st,m); const grab=sideBestGrab(after);
+  dh.state=after; dh.orient=side; dh.last={from:m.from,to:m.to}; dh.sel=null; dh.hints=[]; dh.done=true;
+  if(grab.gain<1.5){ dh.ok=true; dh.streak++; dh.best=Math.max(dh.best,dh.streak); dh.msg='Nothing your opponent can win. That check — every move — is the whole game.'; }
+  else { dh.ok=false; dh.streak=0; dh.msg='After '+toSan(after,grab.move)+' your opponent wins your '+PIECE_NAME[(after.board[grab.move.to]||'p').toLowerCase()]+'. Count attackers vs defenders before you let go.'; }
+  drawDontHang();
+}
+
+/* ---- Checkmate technique: K+Q vs K, K+R vs K (you mate the running king) ---- */
+const ck={type:'KQ',state:null,sel:null,hints:[],moves:0,done:false,ok:false,msg:'',last:null};
+function randEnd(type){ for(let t=0;t<300;t++){ const b=new Array(64).fill(null);
+    const wk=(Math.random()*64)|0, bk=(Math.random()*64)|0, pc=(Math.random()*64)|0;
+    if(new Set([wk,bk,pc]).size<3||kingsAdj(wk,bk)) continue;
+    b[wk]='K'; b[bk]='k'; b[pc]= type==='KQ'?'Q':'R';
+    const s={board:b,turn:'w',castling:{K:false,Q:false,k:false,q:false},ep:null,half:0,full:1};
+    if(inCheck(s,'b')||legalMoves(s).length===0) continue; return s; }
+  return parseFEN(type==='KQ'?'8/8/8/4k3/8/8/3Q4/4K3 w - - 0 1':'8/8/8/4k3/8/8/3R4/4K3 w - - 0 1'); }
+function defendKing(s){ const l=legalMoves(s); let best=l[0],bs=-1e9; const wk=kingSq(s,'w');
+  for(const m of l){ const to=m.to; const edge=Math.min(rOf(to),7-rOf(to),fOf(to),7-fOf(to));
+    const dk=Math.abs(rOf(to)-rOf(wk))+Math.abs(fOf(to)-fOf(wk)); const sc=edge*3+dk+Math.random()*0.8; if(sc>bs){bs=sc;best=m;} }
+  return best; }
+function ckNew(type){ if(type)ck.type=type; ck.state=randEnd(ck.type); ck.moves=0;ck.done=false;ck.msg='';ck.sel=null;ck.hints=[];ck.last=null; drawCheckmate(); }
+function renderCheckmate(){ const P=$('trainBody'); if(!P)return;
+  P.innerHTML=`<p class="muted small" style="margin:2px 0 12px;max-width:64ch">Most players under 800 can't reliably force mate with an extra queen or rook, and let won games slip. Learn the technique: drive the lone king to the edge and mate it. It runs — you corner it. Beware stalemate.</p>
+   <div class="deckbar"><button class="pill" data-t="KQ">K + Queen vs K</button><button class="pill" data-t="KR">K + Rook vs K</button><span style="flex:1"></span><span class="progress" id="ckProg"></span><button class="btn" id="ckNewBtn">New ▸</button></div>
+   <div class="drill-grid"><div><div class="board-wrap" id="ckBoard"></div><div class="side-label" id="ckStatus"></div></div><div id="ckSide"></div></div>`;
+  P.querySelectorAll('[data-t]').forEach(b=>{ if(ck.type===b.dataset.t)b.style.borderColor='var(--accent)'; b.addEventListener('click',()=>ckNew(b.dataset.t)); });
+  $('ckNewBtn').addEventListener('click',()=>ckNew());
+  if(!ck.state) ckNew(ck.type); else drawCheckmate();
+}
+function drawCheckmate(){ const mount=$('ckBoard'); if(!mount)return;
+  renderBoard(mount,ck.state,{orient:'w',selectable:!ck.done&&ck.state.turn==='w',selected:ck.sel,hints:ck.hints,lastMove:ck.last,onSquare:ckClick});
+  $('ckProg').textContent=`Moves: ${ck.moves}`;
+  $('ckStatus').textContent = ck.done?(ck.ok?'Checkmate ✓':'Draw ✗'):'Your move — force the mate.';
+  let h=`<div class="card pad"><div class="eyebrow">${ck.type==='KQ'?'King + Queen':'King + Rook'} vs King</div>
+    <div style="font-size:15px;margin-top:6px">Checkmate the black king. Use your king to help box it in — and never leave it with zero legal moves unless it's mate (that's stalemate = draw).</div>`;
+  if(ck.done) h+=`<div class="verdict ${ck.ok?'right':'wrong'}" style="margin-top:12px"><b>${esc(ck.msg)}</b></div><div style="margin-top:12px"><button class="btn primary" id="ckNextBtn">New position ▸</button></div>`;
+  else h+=`<div class="muted small" style="margin-top:10px">Method: keep your queen/rook a knight's-move from the enemy king to shrink its box, walk your own king up, then mate on the edge.</div>`;
+  h+=`</div>`; $('ckSide').innerHTML=h; const n=$('ckNextBtn'); if(n)n.addEventListener('click',()=>ckNew());
+}
+function ckClick(sq){ if(ck.done||ck.state.turn!=='w')return; const st=ck.state,p=st.board[sq];
+  if(ck.sel===null){ if(p&&colorOf(p)==='w'){ ck.sel=sq;ck.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to);drawCheckmate(); } return; }
+  if(sq===ck.sel){ ck.sel=null;ck.hints=[];drawCheckmate();return; }
+  if(p&&colorOf(p)==='w'){ ck.sel=sq;ck.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to);drawCheckmate();return; }
+  const cands=legalMoves(st).filter(m=>m.from===ck.sel&&m.to===sq); if(!cands.length){ ck.sel=null;ck.hints=[];drawCheckmate();return; }
+  const m=cands[0]; ck.state=makeMove(st,m); ck.last={from:m.from,to:m.to}; ck.moves++; ck.sel=null;ck.hints=[];
+  if(isCheckmate(ck.state)){ ck.done=true;ck.ok=true; ck.msg='Checkmate in '+ck.moves+'! '+(ck.moves<=10?'Clean — that\'s the technique.':'Got it — now try to do it in under 10.'); drawCheckmate(); return; }
+  if(isStalemate(ck.state)){ ck.done=true;ck.ok=false; ck.msg='Stalemate — a draw. The losing king must always have a move until the moment it\'s mate. Give it room, then trap it.'; drawCheckmate(); return; }
+  ck.state=makeMove(ck.state,defendKing(ck.state)); // king runs
+  drawCheckmate();
+}
+
+/* ---- Endgame: King + Pawn vs King (promote it) ---- */
+const kp={state:null,sel:null,hints:[],moves:0,done:false,ok:false,msg:'',last:null};
+function randKP(){ for(let t=0;t<400;t++){ const b=new Array(64).fill(null);
+    const file=(Math.random()*8)|0; const rank=2+((Math.random()*3)|0); const psq=(8-rank)*8+file;
+    const wk=(Math.random()*64)|0, bk=(Math.random()*64)|0;
+    if(new Set([wk,bk,psq]).size<3||kingsAdj(wk,bk)) continue;
+    b[wk]='K'; b[bk]='k'; b[psq]='P';
+    const s={board:b,turn:'w',castling:{K:false,Q:false,k:false,q:false},ep:null,half:0,full:1};
+    if(inCheck(s,'w')||inCheck(s,'b')||legalMoves(s).length===0) continue; return s; }
+  return parseFEN('8/8/8/4k3/8/4P3/4K3/8 w - - 0 1'); }
+function defendKP(s){ const l=legalMoves(s); const psq=s.board.indexOf('P');
+  const cap=l.find(m=>m.captured==='P'); if(cap) return cap;
+  const front = psq>=8? psq-8 : psq; let best=l[0],bs=1e9;
+  for(const m of l){ const d=Math.abs(rOf(m.to)-rOf(front))+Math.abs(fOf(m.to)-fOf(front))+Math.random()*0.4; if(d<bs){bs=d;best=m;} }
+  return best; }
+function kpNew(){ kp.state=randKP(); kp.moves=0;kp.done=false;kp.msg='';kp.sel=null;kp.hints=[];kp.last=null; drawKP(); }
+function renderEndgame(){ const P=$('trainBody'); if(!P)return;
+  P.innerHTML=`<p class="muted small" style="margin:2px 0 12px;max-width:64ch">The king is a fighting piece in the endgame. Learn to escort a pawn home: <b>promote it</b> while the enemy king tries to stop you. This teaches king activity and opposition — skills that win countless close games.</p>
+   <div class="deckbar"><span class="progress" id="kpProg"></span><span style="flex:1"></span><button class="btn" id="kpNewBtn">New position ▸</button></div>
+   <div class="drill-grid"><div><div class="board-wrap" id="kpBoard"></div><div class="side-label" id="kpStatus"></div></div><div id="kpSide"></div></div>`;
+  $('kpNewBtn').addEventListener('click',kpNew);
+  if(!kp.state) kpNew(); else drawKP();
+}
+function drawKP(){ const mount=$('kpBoard'); if(!mount)return;
+  renderBoard(mount,kp.state,{orient:'w',selectable:!kp.done&&kp.state.turn==='w',selected:kp.sel,hints:kp.hints,lastMove:kp.last,onSquare:kpClick});
+  $('kpProg').textContent=`Moves: ${kp.moves}`;
+  $('kpStatus').textContent = kp.done?(kp.ok?'Promoted ✓':'Drawn ✗'):'Your move — escort the pawn.';
+  let h=`<div class="card pad"><div class="eyebrow">King + Pawn vs King</div>
+    <div style="font-size:15px;margin-top:6px">Get your pawn to the last rank and promote it. Use your king to shoulder the enemy king aside and clear the path — don't just push the pawn into its king.</div>`;
+  if(kp.done) h+=`<div class="verdict ${kp.ok?'right':'wrong'}" style="margin-top:12px"><b>${esc(kp.msg)}</b></div><div style="margin-top:12px"><button class="btn primary" id="kpNextBtn">New position ▸</button></div>`;
+  else h+=`<div class="muted small" style="margin-top:10px">Key idea: your king goes in front of the pawn, and take the "opposition" (kings facing with one square between) to force a way through.</div>`;
+  h+=`</div>`; $('kpSide').innerHTML=h; const n=$('kpNextBtn'); if(n)n.addEventListener('click',kpNew);
+}
+function kpClick(sq){ if(kp.done||kp.state.turn!=='w')return; const st=kp.state,p=st.board[sq];
+  if(kp.sel===null){ if(p&&colorOf(p)==='w'){ kp.sel=sq;kp.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to);drawKP(); } return; }
+  if(sq===kp.sel){ kp.sel=null;kp.hints=[];drawKP();return; }
+  if(p&&colorOf(p)==='w'){ kp.sel=sq;kp.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to);drawKP();return; }
+  const cands=legalMoves(st).filter(m=>m.from===kp.sel&&m.to===sq); if(!cands.length){ kp.sel=null;kp.hints=[];drawKP();return; }
+  const m=cands.find(x=>x.promo==='q')||cands[0]; kp.state=makeMove(st,m); kp.last={from:m.from,to:m.to}; kp.moves++; kp.sel=null;kp.hints=[];
+  if(m.flags.includes('p')){ kp.done=true;kp.ok=true; kp.msg='Promoted! With a queen it\'s an easy win. That\'s how you convert a pawn.'; drawKP(); return; }
+  if(kp.moves>40){ kp.done=true;kp.ok=false; kp.msg='Taking too long — reset and try leading with your king in front of the pawn.'; drawKP(); return; }
+  kp.state=makeMove(kp.state,defendKP(kp.state)); kp.last=null;
+  if(kp.state.board.indexOf('P')<0 && kp.state.board.indexOf('Q')<0){ kp.done=true;kp.ok=false; kp.msg='Your pawn was captured — king vs king is a draw. Keep your king close to defend the pawn as it advances.'; }
+  drawKP();
+}
+
+/* ---- Opening trainer: drill the book moves of a repertoire ---- */
+const ot={idx:0,ply:0,state:null,orient:'w',sel:null,hints:[],score:0,asked:0,msg:'',wrong:false,done:false,last:null};
+function otSideToGuess(){ const o=CURATED_OPENINGS[ot.idx]; const whiteMove=ot.ply%2===0; return (whiteMove&&o.side==='White')||(!whiteMove&&o.side==='Black'); }
+function otAdvanceOpponent(){ const o=CURATED_OPENINGS[ot.idx];
+  while(ot.ply<o.line.length && !otSideToGuess()){ const san=o.line[ot.ply][0]; const m=moveFromSan(ot.state,san); if(!m)break;
+    ot.state=makeMove(ot.state,m); ot.last={from:m.from,to:m.to}; ot.ply++; }
+  if(ot.ply>=o.line.length) ot.done=true;
+}
+function otStart(){ const o=CURATED_OPENINGS[ot.idx]; ot.ply=0; ot.state=newGame(); ot.orient=o.side==='Black'?'b':'w';
+  ot.sel=null;ot.hints=[];ot.msg='';ot.wrong=false;ot.done=false;ot.score=0;ot.asked=0;ot.last=null; otAdvanceOpponent(); drawOT(); }
+function renderOpeningTrainer(){ const P=$('trainBody'); if(!P)return;
+  // order openings: the user's most-played first
+  const order=CURATED_OPENINGS.map((o,i)=>i);
+  if(PROFILE){ const fav=[PROFILE.openWhiteName,PROFILE.openBlackName].filter(Boolean);
+    order.sort((a,b)=>(fav.includes(CURATED_OPENINGS[b].name)?1:0)-(fav.includes(CURATED_OPENINGS[a].name)?1:0)); }
+  P.innerHTML=`<p class="muted small" style="margin:2px 0 12px;max-width:64ch">Learn your openings by heart — the moves <em>and</em> the ideas. Play the book move; deviate and you'll see the right one and why. The openings you already play are listed first.</p>
+   <div class="deckbar"><select class="txt" id="otPick"></select><span style="flex:1"></span><span class="progress" id="otProg"></span></div>
+   <div class="drill-grid"><div><div class="board-wrap" id="otBoard"></div><div class="side-label" id="otStatus"></div></div><div id="otSide"></div></div>`;
+  const sel=$('otPick'); order.forEach(i=>{ const o=CURATED_OPENINGS[i]; const op=el('option',null,o.name+' — for '+o.side); op.value=i; if(i===ot.idx)op.selected=true; sel.appendChild(op); });
+  sel.addEventListener('change',()=>{ ot.idx=+sel.value; otStart(); });
+  otStart();
+}
+function drawOT(){ const o=CURATED_OPENINGS[ot.idx]; const mount=$('otBoard'); if(!mount)return;
+  const guess = !ot.done && otSideToGuess();
+  renderBoard(mount,ot.state,{orient:ot.orient,selectable:guess,selected:ot.sel,hints:ot.hints,lastMove:ot.last,onSquare:otClick});
+  $('otProg').textContent=`${o.name} · ${ot.score}/${ot.asked}`;
+  $('otStatus').textContent = ot.done?'Line complete.':(guess?('Your move ('+(Math.floor(ot.ply/2)+1)+') — play the book move'):'…');
+  let h=`<div class="card pad"><div class="eyebrow">${esc(o.name)} · for ${esc(o.side)}</div>`;
+  if(ot.msg) h+=`<div class="verdict ${ot.wrong?'wrong':'right'}" style="margin-top:8px"><div class="small">${esc(ot.msg)}</div></div>`;
+  else h+=`<div class="small muted" style="margin-top:8px">${esc(o.summary)}</div>`;
+  if(ot.done){ h+=`<div style="margin-top:12px;font-weight:600">Score: ${ot.score}/${ot.asked}</div>
+     <div class="row" style="margin-top:10px"><button class="btn primary" id="otRestart">Run it again ▸</button></div>`; }
+  else if(guess) h+=`<div class="muted small" style="margin-top:10px">Recall the move. Not sure? Make your best guess — you'll get the answer and the idea either way.</div>`;
+  h+=`</div>`; $('otSide').innerHTML=h;
+  const rs=$('otRestart'); if(rs)rs.addEventListener('click',otStart);
+}
+function otClick(sq){ if(ot.done||!otSideToGuess())return; const st=ot.state,side=st.turn,p=st.board[sq];
+  if(ot.sel===null){ if(p&&colorOf(p)===side){ ot.sel=sq;ot.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to);drawOT(); } return; }
+  if(sq===ot.sel){ ot.sel=null;ot.hints=[];drawOT();return; }
+  if(p&&colorOf(p)===side){ ot.sel=sq;ot.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to);drawOT();return; }
+  const cands=legalMoves(st).filter(m=>m.from===ot.sel&&m.to===sq); if(!cands.length){ ot.sel=null;ot.hints=[];drawOT();return; }
+  const m=cands.find(x=>x.promo==='q')||cands[0]; otGuess(m);
+}
+function otGuess(m){ const o=CURATED_OPENINGS[ot.idx]; const want=o.line[ot.ply]; const wantSan=want[0].replace(/[+#]/,'');
+  const played=toSan(ot.state,m).replace(/[+#]/,''); ot.asked++;
+  if(played===wantSan){ ot.score++; ot.wrong=false; ot.msg='✓ '+want[0]+' — '+want[1]; ot.state=makeMove(ot.state,m); ot.last={from:m.from,to:m.to}; ot.ply++; }
+  else { ot.wrong=true; const bm=moveFromSan(ot.state,want[0]); ot.msg='You played '+played+'. The book move is '+want[0]+' — '+want[1];
+    if(bm){ ot.state=makeMove(ot.state,bm); ot.last={from:bm.from,to:bm.to}; } ot.ply++; }
+  ot.sel=null; ot.hints=[]; otAdvanceOpponent(); drawOT();
+}
+/* end:train */
 </script>
 
 <script>
@@ -1857,7 +2061,7 @@ function RENDER_profile(){
     </div></div>`;
   if(!isExample) html+=`<div style="margin-top:18px"><button class="btn ghost" id="clearData">Clear my saved games &amp; stats</button></div>`;
   P.innerHTML=html;
-  P.querySelectorAll('[data-drill]').forEach(b=>b.addEventListener('click',()=>{ puz.filter=b.dataset.drill; switchTab('puzzles'); applyPuzFilter(b.dataset.drill); }));
+  P.querySelectorAll('[data-drill]').forEach(b=>b.addEventListener('click',()=>{ train.mode='tactics'; puz.filter=b.dataset.drill; switchTab('puzzles'); applyPuzFilter(b.dataset.drill); }));
   const cd=$('clearData'); if(cd)cd.addEventListener('click',()=>{ if(confirm('Delete all saved games, stats, and your behaviour log? This cannot be undone.')){ STORE.games=[]; STORE.puzzleStats={solved:0,attempts:0}; STORE.behavior={moves:[]}; persist(); RENDER_profile(); } });
 }
 RENDER.profile=RENDER_profile;
@@ -1915,7 +2119,7 @@ function setSyncBadge(state){ const b=$('syncBadge'); if(!b)return;
   else if(state==='syncing'){ b.textContent='☁ syncing…'; b.style.color='var(--ink-2)'; }
   else { b.textContent='● this device'; b.style.color='var(--ink-3)'; b.title='Saved on this device only. Open the published app on your account to sync across phone and laptop.'; }
 }
-function snapshotState(){ return {games:STORE.games,username:STORE.username,level:STORE.level,theme:STORE.theme||'system',puzzleStats:STORE.puzzleStats,behavior:STORE.behavior,adaptiveLevel:STORE.adaptiveLevel,puzzleFails:STORE.puzzleFails,ts:Date.now()}; }
+function snapshotState(){ return {games:STORE.games,username:STORE.username,level:STORE.level,theme:STORE.theme||'system',puzzleStats:STORE.puzzleStats,behavior:STORE.behavior,adaptiveLevel:STORE.adaptiveLevel,puzzleFails:STORE.puzzleFails,srs:STORE.srs,ts:Date.now()}; }
 function mergeRemote(r){ if(!r)return false; let changed=false;
   const seen=new Set(STORE.games.map(g=>g.pgn));
   for(const g of (r.games||[])){ if(g&&g.pgn&&!seen.has(g.pgn)){ STORE.games.push(g); seen.add(g.pgn); changed=true; } }
@@ -1926,6 +2130,7 @@ function mergeRemote(r){ if(!r)return false; let changed=false;
   if(r.puzzleStats && (r.puzzleStats.solved||0)>(STORE.puzzleStats.solved||0)){ STORE.puzzleStats=r.puzzleStats; changed=true; }
   if(typeof r.adaptiveLevel==='number'){ STORE.adaptiveLevel=Math.max(STORE.adaptiveLevel||2,r.adaptiveLevel); }
   if(r.puzzleFails){ for(const k in r.puzzleFails){ if(!STORE.puzzleFails[k]){ STORE.puzzleFails[k]=1; changed=true; } } }
+  if(r.srs){ for(const k in r.srs){ STORE.srs[k]=Math.max(STORE.srs[k]||0, r.srs[k]); } }
   if(r.username && !STORE.username){ STORE.username=r.username; changed=true; }
   if(changed){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} }
   return changed;

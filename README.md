@@ -18,7 +18,12 @@ A pocket chess coach for beginners, built to take you from "can't get past 300" 
   - a plain-English **position assessment** — who's ahead and *why*, your development, whether your king is safe, and **what your opponent is threatening right now**,
   - a **"your move" tip** telling you what to think about next (castle now, grab the free piece, meet the threat…),
   - if you blunder: the mistake, the **better move**, and the **thinking habit** that would have caught it — plus a one-click **"take it back & try again."**
-- **Puzzles** — A drill deck built from mini-games, engine-verified tactics, and — the good part — **your own real mistakes** from games you play and import. Every puzzle is correct by construction.
+- **Train** — a gym of focused drill modes, each one engine-verified so it can never teach you the wrong thing:
+  - **Tactics** — a gauntlet of real positions (classic tactics, the mini-games, and **your own mistakes**) with a streak counter and **spaced repetition**: positions you miss come back until you've solved them twice, and your current weakness is served first.
+  - **Don't hang** — an *infinite* generator of fresh middlegame positions; just make a move that doesn't let your opponent win material. Instant pass/fail, build a streak. This drills the single habit that decides games under 800.
+  - **Checkmate** — learn to actually force mate with **King + Queen vs King** and **King + Rook vs King**. The lone king runs; you corner and mate it (and it warns you about stalemate). Most sub-800 players can't do this reliably — now you will.
+  - **Endgames** — **King + Pawn vs King**: escort your pawn home and promote it while the enemy king tries to stop you. Teaches king activity and opposition.
+  - **Openings** — drill a solid repertoire by heart, the moves *and* the ideas; play the book move, and if you deviate you get the right move and why. The openings you already play are listed first.
 - **Openings by the book** — An interactive opening book that teaches the *idea* behind each move (not 20 moves of memorization), plus a starter repertoire and a dictionary of named openings so you know them all by name.
 - **Review a game** — Paste a PGN from chess.com and get a move-by-move coached walkthrough, with your blunders and mistakes marked.
 - **Your game** — Behaviour analysis across everything you've played and imported: your top leaks ranked, your style, your castling habit, and the one habit to fix next.
