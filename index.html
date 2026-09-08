@@ -532,13 +532,19 @@ const LEVELS=[
   {name:'Strong',   depth:3, q:true,  blunder:0.0,  slop:12},
   {name:'Sharp',    depth:4, q:true,  blunder:0.0,  slop:0}
 ];
-function chooseBotMove(s,levelIdx){
+function chooseBotMove(s,levelIdx,opts){
   const L=LEVELS[Math.max(0,Math.min(LEVELS.length-1,levelIdx))];
   const legal=legalMoves(s); if(!legal.length)return null;
+  // steer into the user's usual opening (reps where their mistakes live)
+  if(opts && opts.prof && opts.sans){ const steer=openingSteerMove(s,opts.sans,opts); if(steer && Math.random()<0.72) return steer; }
   if(Math.random()<L.blunder) return legal[Math.floor(Math.random()*legal.length)];
   const ranked=searchRanked(s,L.depth,L.q);
   const top=ranked[0].sc;
-  const pool=ranked.filter(r=>top-r.sc<=L.slop);
+  const pool=ranked.filter(r=>top-r.sc<=L.slop);   // only SOUND moves (within slop of the true best)
+  // among sound moves, pick the one that most probes the user's weaknesses
+  if(opts && opts.prof){ let best=pool[0].m, bs=-1e9;
+    for(const r of pool){ const bias=styleBias(s,r.m,opts.prof,opts.youAre)+Math.random()*6; if(bias>bs){bs=bias;best=r.m;} }
+    return best; }
   return pool[Math.floor(Math.random()*pool.length)].m;
 }
 
@@ -574,8 +580,9 @@ const THINK={
 
 // how many valuable (>=3) pieces of victimColor does the piece on `sq` attack?
 function countAttacksOnValuable(state,sq,victimColor){ let n=0;
-  for(let t=0;t<64;t++){ const p=state.board[t]; if(p&&colorOf(p)===victimColor&&VAL[p.toLowerCase()]>=3){ if(attackersFrom(state,t,other(victimColor)).includes(sq)) n++; } }
-  return n; }
+  for(let t=0;t<64;t++){ const p=state.board[t]; if(!p||colorOf(p)!==victimColor)continue;
+    const tt=p.toLowerCase(); if(tt==='k'||VAL[tt]>=3){ if(attackersFrom(state,t,other(victimColor)).includes(sq)) n++; } }
+  return n; }  // king counts — a knight forking king+queen is the classic fork
 function isForkGrab(afterOurMove,grabMove){ if(!grabMove)return false; const victim=other(afterOurMove.turn);
   const after=makeMove(afterOurMove,grabMove); return countAttacksOnValuable(after,grabMove.to,victim)>=2; }
 
@@ -939,10 +946,12 @@ let STORE={};
 try{ STORE=JSON.parse(localStorage.getItem(KEY))||{}; }catch(e){ STORE={}; }
 STORE.games=STORE.games||[];
 STORE.username=STORE.username||'';
-STORE.level=(STORE.level==null?3:STORE.level);
+STORE.level=(STORE.level==null?-1:STORE.level); // -1 = Adaptive (auto-tunes to you)
 STORE.puzzleStats=STORE.puzzleStats||{solved:0,attempts:0};
 STORE.behavior=STORE.behavior||{moves:[]};      // per-move behaviour log (drives your personal heuristics)
 STORE.training=(STORE.training===undefined?true:STORE.training);
+STORE.adaptiveLevel=(STORE.adaptiveLevel==null?2:STORE.adaptiveLevel); // float, auto-tunes to your results
+STORE.puzzleFails=STORE.puzzleFails||{};        // fens you've missed, to resurface
 function persist(){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} if(window.__syncPush)window.__syncPush(); }
 
 /* PGN parsing */
@@ -1118,18 +1127,75 @@ function gateQuestion(cat,fork){
 
 <script>
 /* ============================================================
+   ADAPTIVE ENGINE — the app evolves to challenge YOU:
+   difficulty auto-tunes to your results, the bot biases its
+   moves toward your weaknesses and steers into your openings.
+   ============================================================ */
+let PROFILE=null;
+function seqForOpening(name){ if(!name)return null; let best=null;
+  for(const [seq,nm] of OPENING_BOOK){ if(nm===name){ const arr=seq.split(' '); if(!best||arr.length>best.length)best=arr; } }
+  return best; }
+function computeProfile(){
+  const BR=behaviourReport(); const games=STORE.games||[];
+  let castleG=0,nG=0; const openW={},openB={};
+  for(const g of games){ const p=parsePGN(g.pgn); if(!p.ok)continue; nG++;
+    const nm=identifyOpening(p.sans).name; const bucket=g.youAre==='w'?openW:openB; bucket[nm]=(bucket[nm]||0)+1;
+    if(analyzeGame(p,g.youAre).summary.castled) castleG++; }
+  const topCat=Object.entries(BR.cats).sort((a,b)=>b[1]-a[1])[0];
+  const topPiece=Object.entries(BR.byPiece).sort((a,b)=>b[1]-a[1])[0];
+  const most=o=>{ const e=Object.entries(o).sort((a,b)=>b[1]-a[1])[0]; return e?e[0]:null; };
+  const openWhiteName=most(openW), openBlackName=most(openB), castleRate=nG?castleG/nG:1;
+  return { BR, leak: topCat?topCat[0]:null, forks:BR.forks, topPiece:topPiece?topPiece[0]:null,
+    fork: BR.forks>=2 || (topPiece&&topPiece[0]==='n'&&topPiece[1]>=2),
+    hang: (BR.cats.hung_piece||0)>=2 || (BR.cats.missed_material||0)>=2,
+    king: (BR.cats.allowed_mate||0)>=1 || (nG>=2 && castleRate<0.5),
+    castleRate, openWhiteName, openBlackName,
+    steerSeqWhite: seqForOpening(openWhiteName), steerSeqBlack: seqForOpening(openBlackName) };
+}
+function refreshProfile(){ try{ PROFILE=computeProfile(); }catch(e){ PROFILE=null; } }
+function effectiveLevel(){ return play.level===-1 ? Math.max(0,Math.min(LEVELS.length-1,Math.round(STORE.adaptiveLevel))) : play.level; }
+function updateAdaptive(won,lost,blunders){
+  let d=0; if(won)d+=0.5; else if(lost)d-=0.4;
+  d-=Math.min(0.4,(blunders||0)*0.1); if(won&&!blunders)d+=0.3;
+  STORE.adaptiveLevel=Math.max(0,Math.min(LEVELS.length-1,(STORE.adaptiveLevel??2)+d));
+}
+// how much does this (sound) bot move probe the user's weaknesses? higher = nastier for the user.
+function styleBias(s,m,prof,user){
+  if(!prof) return 0; if(!user) user=other(s.turn);
+  let b=0; const after=makeMove(s,m), mt=m.to, opp=other(user);
+  if(prof.fork && VAL[m.piece.toLowerCase()]<=3 && countAttacksOnValuable(after,mt,user)>=2) b+=60;
+  if(prof.hang){ for(let t=0;t<64;t++){ const p=after.board[t];
+    if(p&&colorOf(p)===user&&VAL[p.toLowerCase()]>=3 && attackersFrom(after,t,opp).includes(mt)){ b+=24; break; } } }
+  if(prof.king && s.full<=12){ const weak=user==='b'?nameToSq('f7'):nameToSq('f2');
+    if(attackersFrom(after,weak,opp).includes(mt)) b+=30;
+    if(inCheck(after,user)) b+=16; }
+  return b;
+}
+// reproduce the user's most-played opening so they get reps where their mistakes live
+function openingSteerMove(s,sans,opts){
+  const seq = opts.youAre==='w'? opts.prof.steerSeqWhite : opts.prof.steerSeqBlack;
+  if(!seq || sans.length>=seq.length) return null;
+  for(let i=0;i<sans.length;i++){ if(sans[i]!==seq[i]) return null; }
+  return moveFromSan(s,seq[sans.length]);
+}
+/* end:adaptive */
+</script>
+
+<script>
+/* ============================================================
    PLAY & COACH  — the flagship. Play the bot; the coach reacts
    to every move: names the opening, assesses, flags mistakes,
    teaches the thinking, and offers a take-back to try again.
    ============================================================ */
 const play={ state:newGame(), youAre:'w', level:STORE.level, history:[], sans:[],
   selected:null, hints:[], lastMove:null, over:false, status:'', lastAnn:null, thinking:false, retryFrom:null,
-  training:STORE.training!==false, pendingBlunder:null, awaitingCatch:null, hintLevel:0, moveStart:null };
+  training:STORE.training!==false, pendingBlunder:null, awaitingCatch:null, hintLevel:0, moveStart:null, gameBlunders:0 };
 
 function newPlayGame(youAre,level){
   play.state=newGame(); play.youAre=youAre; play.level=level; play.history=[]; play.sans=[];
   play.selected=null; play.hints=[]; play.lastMove=null; play.over=false; play.status=''; play.lastAnn=null; play.thinking=false; play.retryFrom=null;
-  play.pendingBlunder=null; play.awaitingCatch=null; play.hintLevel=0; play.moveStart=null;
+  play.pendingBlunder=null; play.awaitingCatch=null; play.hintLevel=0; play.moveStart=null; play.gameBlunders=0;
+  refreshProfile();
   STORE.level=level; persist();
   drawPlay();
   if(play.youAre==='b') setTimeout(botMove,350); // bot is White, moves first
@@ -1170,6 +1236,7 @@ function RENDER_play(){
     cp.appendChild(b);
   });
   const lp=$('levelPick');
+  const adOpt=el('option',null,'Adaptive — auto (recommended)'); adOpt.value=-1; if(play.level===-1)adOpt.selected=true; lp.appendChild(adOpt);
   LEVELS.forEach((L,i)=>{ const o=el('option',null,L.name+(i===0?' (easiest)':i===LEVELS.length-1?' (hardest)':'')); o.value=i; if(i===play.level)o.selected=true; lp.appendChild(o); });
   lp.addEventListener('change',()=>{ play.level=+lp.value; STORE.level=play.level; persist(); });
   const tt=$('trainToggle'); tt.checked=play.training;
@@ -1239,13 +1306,14 @@ function logBehaviour(before,m,ann,ms,override,caught){
   const rec={ t:Date.now(), no:Math.floor(play.sans.length/2)+1, san:toSan(before,m).replace(/[*+#]/,''),
     verdict:ann.tag||'ok', category:ann.category||null, ms:ms||0, phase:phaseOf(before),
     byPiece:ann.byPiece||null, fork:!!ann.fork, hint:play.hintLevel||0, override:!!override, caught:!!caught };
+  if(rec.verdict==='blunder') play.gameBlunders=(play.gameBlunders||0)+1;
   STORE.behavior.moves.push(rec);
   if(STORE.behavior.moves.length>800) STORE.behavior.moves=STORE.behavior.moves.slice(-800);
   persist();
 }
 function botMove(){
   if(play.over){ play.thinking=false; return; }
-  const m=chooseBotMove(play.state,play.level);
+  const m=chooseBotMove(play.state,effectiveLevel(),{prof:PROFILE,sans:play.sans,youAre:play.youAre});
   if(!m){ play.thinking=false; checkEnd(); drawPlay(); return; }
   const san=toSan(play.state,m);
   play.history.push({state:play.state,move:m,san,bot:true});
@@ -1308,7 +1376,11 @@ function savePlayed(kind){
   const pgn=`[White "${white}"]\n[Black "${black}"]\n[Result "${result}"]\n\n`+sansToPgn(play.sans,result);
   STORE.games.push({pgn,youAre:you,source:'played',date:Date.now()});
   if(STORE.games.length>200) STORE.games=STORE.games.slice(-200);
-  persist();
+  // adaptive difficulty: nudge the auto-level from how this game went
+  const won=(result==='1-0'&&you==='w')||(result==='0-1'&&you==='b');
+  const lost=(result==='1-0'&&you==='b')||(result==='0-1'&&you==='w');
+  updateAdaptive(won,lost,play.gameBlunders||0);
+  persist(); refreshProfile();
 }
 function sansToPgn(sans,result){
   let out=''; for(let i=0;i<sans.length;i++){ if(i%2===0)out+=(i/2+1)+'. '; out+=sans[i]+' '; }
@@ -1331,6 +1403,22 @@ function drawCoach(){
         <button class="btn primary" id="gateLook">I'll look again</button>
         <button class="btn" id="gatePlay">Play it anyway</button></div>
       <div class="muted small" style="margin-top:8px">Spot it yourself, then click a different move — or take it back. (Turn this off with “Blunder-check” above.)</div></div>`;
+  }
+  // adapting-to-you: show how the app is currently tuned to challenge you
+  if(!play.pendingBlunder && PROFILE){
+    const eff=effectiveLevel();
+    const strength = play.level===-1? 'Adaptive → '+LEVELS[eff].name : LEVELS[eff].name;
+    const targets=[]; if(PROFILE.fork)targets.push('knight forks'); if(PROFILE.hang)targets.push('loose pieces'); if(PROFILE.king)targets.push('your king &amp; f7');
+    const oName = play.youAre==='w'?PROFILE.openWhiteName:PROFILE.openBlackName;
+    const steerSeq = play.youAre==='w'?PROFILE.steerSeqWhite:PROFILE.steerSeqBlack;
+    const steering = steerSeq && play.sans.length<steerSeq.length;
+    html+=`<div class="card pad" style="margin-bottom:14px;border-left:4px solid var(--info)">
+       <div class="eyebrow" style="color:var(--info)">Adapting to you</div>
+       <div class="small" style="margin-top:5px;line-height:1.6">
+         <div>▸ Opponent: <b>${esc(strength)}</b>${play.level===-1?' <span class="muted">— rises when you win clean, eases when you struggle</span>':''}</div>
+         ${targets.length?`<div>▸ Probing your weak spots: <b>${targets.join(' · ')}</b></div>`:''}
+         ${oName&&steering?`<div>▸ Steering into your <b>${esc(oName)}</b> — get it right this time</div>`:''}
+       </div></div>`;
   }
   // your rule to focus on (evolves from your behaviour log)
   const _rules=personalRules();
@@ -1442,6 +1530,10 @@ function applyPuzFilter(v,silent){
   puz.view = v==='all'? puz.pool.slice() : puz.pool.filter(p=>p.category===v);
   // shuffle for variety
   for(let i=puz.view.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [puz.view[i],puz.view[j]]=[puz.view[j],puz.view[i]]; }
+  // adaptive weighting: put positions you've failed, and your current weakness, first
+  if(v==='all'){ const leak=PROFILE&&PROFILE.leak;
+    puz.view.forEach(p=>p._pri=(STORE.puzzleFails[p.fen]?2:0)+(leak&&p.category===leak?1:0)+Math.random()*0.4);
+    puz.view.sort((a,b)=>b._pri-a._pri); }
   puz.i=0;
   if(!silent){ RENDER_puzzles(); }
 }
@@ -1486,8 +1578,8 @@ function onPuzSquare(sq){
   const m=cands.find(x=>x.promo==='q')||cands[0];
   const ok=checkPuzzle(puz.cur.fen,puz.cur.category,puz.cur.solutionSan,m);
   STORE.puzzleStats.attempts++;
-  if(ok){ STORE.puzzleStats.solved++; puz.solved=true; puz.lastMove={from:m.from,to:m.to}; puz.state=makeMove(puz.state,m); }
-  else { puz.tried=true; }
+  if(ok){ STORE.puzzleStats.solved++; puz.solved=true; puz.lastMove={from:m.from,to:m.to}; puz.state=makeMove(puz.state,m); delete STORE.puzzleFails[puz.cur.fen]; }
+  else { puz.tried=true; STORE.puzzleFails[puz.cur.fen]=1; }
   persist();
   puz.selected=null; puz.hints=[];
   drawPuzzle();
@@ -1823,7 +1915,7 @@ function setSyncBadge(state){ const b=$('syncBadge'); if(!b)return;
   else if(state==='syncing'){ b.textContent='☁ syncing…'; b.style.color='var(--ink-2)'; }
   else { b.textContent='● this device'; b.style.color='var(--ink-3)'; b.title='Saved on this device only. Open the published app on your account to sync across phone and laptop.'; }
 }
-function snapshotState(){ return {games:STORE.games,username:STORE.username,level:STORE.level,theme:STORE.theme||'system',puzzleStats:STORE.puzzleStats,behavior:STORE.behavior,ts:Date.now()}; }
+function snapshotState(){ return {games:STORE.games,username:STORE.username,level:STORE.level,theme:STORE.theme||'system',puzzleStats:STORE.puzzleStats,behavior:STORE.behavior,adaptiveLevel:STORE.adaptiveLevel,puzzleFails:STORE.puzzleFails,ts:Date.now()}; }
 function mergeRemote(r){ if(!r)return false; let changed=false;
   const seen=new Set(STORE.games.map(g=>g.pgn));
   for(const g of (r.games||[])){ if(g&&g.pgn&&!seen.has(g.pgn)){ STORE.games.push(g); seen.add(g.pgn); changed=true; } }
@@ -1832,6 +1924,8 @@ function mergeRemote(r){ if(!r)return false; let changed=false;
     for(const mv of r.behavior.moves){ if(mv&&!ts.has(mv.t)){ STORE.behavior.moves.push(mv); ts.add(mv.t); changed=true; } }
     STORE.behavior.moves.sort((a,b)=>a.t-b.t); if(STORE.behavior.moves.length>800) STORE.behavior.moves=STORE.behavior.moves.slice(-800); }
   if(r.puzzleStats && (r.puzzleStats.solved||0)>(STORE.puzzleStats.solved||0)){ STORE.puzzleStats=r.puzzleStats; changed=true; }
+  if(typeof r.adaptiveLevel==='number'){ STORE.adaptiveLevel=Math.max(STORE.adaptiveLevel||2,r.adaptiveLevel); }
+  if(r.puzzleFails){ for(const k in r.puzzleFails){ if(!STORE.puzzleFails[k]){ STORE.puzzleFails[k]=1; changed=true; } } }
   if(r.username && !STORE.username){ STORE.username=r.username; changed=true; }
   if(changed){ try{ localStorage.setItem(KEY,JSON.stringify(STORE)); }catch(e){} }
   return changed;
@@ -1847,6 +1941,7 @@ async function initSync(){
     const snap=await DB_DOC.get();
     if(snap && snap.exists) mergeRemote(snap.data());
     await DB_DOC.set(snapshotState());
+    refreshProfile();
     setSyncBadge('synced');
     const t=document.querySelector('.tab[aria-selected="true"]'); if(t&&RENDER[t.dataset.tab]) RENDER[t.dataset.tab]();
     DB_DOC.onSnapshot(s=>{ if(s&&s.exists){ const ch=mergeRemote(s.data());
@@ -1859,6 +1954,7 @@ async function initSync(){
 /* ---- boot ---- */
 initTheme();
 initTabs();
+refreshProfile();
 RENDER_play();
 initSync();
 /* end:boot */

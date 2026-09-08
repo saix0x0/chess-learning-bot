@@ -11,6 +11,8 @@ A pocket chess coach for beginners, built to take you from "can't get past 300" 
   - **Tiered hint:** the 💡 gives a category nudge first, then the area, and only then the move — so you still do the work.
   - **A personal, evolving rulebook:** every move is logged (what you played, the verdict, how long you took, which enemy piece punished you, whether it was a fork). Those patterns become a short, ranked checklist of *your* rules — "Slow down, you blunder when you rush", "Watch for enemy knight forks" — shown right next to the board and in **Your game**, updating as your mistakes change.
 
+  - **It adapts to you.** Difficulty is **Adaptive** by default: the bot's strength auto-tunes to your results (it rises when you win without blunders, eases when you struggle). The opponent also **biases its moves toward your specific weaknesses** — if you fall for knight forks it will look for forks, if you get mated on f7 it will pressure f7, if you don't castle it goes after your king — always choosing among its *sound* moves, so it probes your weak spots without ever throwing the game. And it **steers into the openings you actually play**, so you get reps in the positions where your mistakes live. A small "Adapting to you" panel shows exactly how it's currently tuned.
+
   On top of that, after each move you still get:
   - the **opening / variation** you're in, named live ("Italian Game, Giuoco Piano"…),
   - a plain-English **position assessment** — who's ahead and *why*, your development, whether your king is safe, and **what your opponent is threatening right now**,
