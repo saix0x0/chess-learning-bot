@@ -950,6 +950,7 @@ STORE.level=(STORE.level==null?-1:STORE.level); // -1 = Adaptive (auto-tunes to 
 STORE.puzzleStats=STORE.puzzleStats||{solved:0,attempts:0};
 STORE.behavior=STORE.behavior||{moves:[]};      // per-move behaviour log (drives your personal heuristics)
 STORE.training=(STORE.training===undefined?true:STORE.training);
+STORE.predict=(STORE.predict===true);           // "predict the opponent's reply" trainer in Play
 STORE.adaptiveLevel=(STORE.adaptiveLevel==null?2:STORE.adaptiveLevel); // float, auto-tunes to your results
 STORE.puzzleFails=STORE.puzzleFails||{};        // fens you've missed, to resurface
 STORE.srs=STORE.srs||{};                         // fen -> correct-streak (spaced repetition; retire at 2)
@@ -1072,11 +1073,13 @@ function initTheme(){
    ============================================================ */
 function behaviourReport(){
   const moves=(STORE.behavior&&STORE.behavior.moves)||[];
-  const R={total:moves.length,blunders:0,mistakes:0,inacc:0,cats:{},byPiece:{},forks:0,
+  const R={total:0,blunders:0,mistakes:0,inacc:0,cats:{},byPiece:{},forks:0,
     fast:{n:0,bad:0},slow:{n:0,bad:0},phase:{opening:0,middlegame:0,endgame:0},
-    overrides:0,catches:0,hintUsed:0,avgMs:0};
+    overrides:0,catches:0,hintUsed:0,avgMs:0, predict:{total:0,exact:0,idea:0,miss:0}};
   let msSum=0,msN=0;
   for(const m of moves){
+    if(m.predict){ R.predict.total++; R.predict[m.predict]=(R.predict[m.predict]||0)+1; continue; }
+    R.total++;
     const bad = m.verdict==='blunder'||m.verdict==='mistake';
     if(m.verdict==='blunder')R.blunders++; else if(m.verdict==='mistake')R.mistakes++; else if(m.verdict==='inaccuracy')R.inacc++;
     if(bad && m.category) R.cats[m.category]=(R.cats[m.category]||0)+1;
@@ -1184,18 +1187,59 @@ function openingSteerMove(s,sans,opts){
 
 <script>
 /* ============================================================
+   ATTACK & PREDICTION helpers — teach target-spotting, building
+   attacks, and anticipating the opponent.
+   ============================================================ */
+// enemy pieces attacked by the piece standing on `sq`
+function attacksFromSquare(state,sq){ const p=state.board[sq]; if(!p) return []; const me=colorOf(p),opp=other(me),out=[];
+  for(let t=0;t<64;t++){ const q=state.board[t]; if(q&&colorOf(q)===opp&&attackersFrom(state,t,me).includes(sq)) out.push({sq:t,piece:q}); }
+  return out; }
+// the opponent's loosest worthwhile piece (undefended, or attacked at least as often as defended)
+function loosestEnemy(state,side){ const opp=other(side); let best=null;
+  for(let t=0;t<64;t++){ const q=state.board[t]; if(!q||colorOf(q)!==opp) continue; const v=VAL[q.toLowerCase()]; if(v<1) continue;
+    const att=attackersFrom(state,t,side).length, def=attackersFrom(state,t,opp).length;
+    let score=-1; if(att>0&&att>=def) score=v+(def===0?2:0); else if(def===0&&v>=3) score=v;
+    if(score>0 && (!best||score>best.score)) best={sq:t,piece:q,score,att,def,undefended:def===0}; }
+  return best; }
+// enemy king exposure from `side`'s perspective
+function kingTarget(state,side){ const opp=other(side); const k=kingSq(state,opp); if(k<0) return null;
+  const castled=fOf(k)>=6||fOf(k)<=2; let attackers=0,defenders=0;
+  for(let dr=-1;dr<=1;dr++) for(let df=-1;df<=1;df++){ const r=rOf(k)+dr,f=fOf(k)+df; if(!inb(r,f))continue; const s2=r*8+f;
+    attackers+=attackersFrom(state,s2,side).length; defenders+=attackersFrom(state,s2,opp).length; }
+  return {sq:k,castled,attackers,defenders,attackable: attackers>=2 || (!castled&&state.full>=6)}; }
+// candidate attacking moves for the side to move: checks, king-zone pressure, winning loose pieces
+function attackIdeas(state){ const opp=other(state.turn), k=kingSq(state,opp), out=[];
+  for(const m of legalMoves(state)){ if(givesMate(state,m)){ out.push({m,score:100,san:toSan(state,m),reason:'checkmate'}); continue; }
+    const after=makeMove(state,m); let score=0; const reasons=[];
+    if(inCheck(after,opp)){ score+=3; reasons.push('a check'); }
+    if(m.captured){ const net=VAL[m.captured.toLowerCase()]-seeMax(after,m.to); if(net>=1){ score+=net; reasons.push('wins the '+PIECE_NAME[m.captured.toLowerCase()]); } }
+    if(k>=0 && Math.abs(rOf(m.to)-rOf(k))<=1 && Math.abs(fOf(m.to)-fOf(k))<=1){ score+=1.5; reasons.push('lands next to their king'); }
+    if(!m.captured){ const hits=attacksFromSquare(after,m.to).filter(x=>VAL[x.piece.toLowerCase()]>=3); if(hits.length){ score+=1; reasons.push('attacks the '+PIECE_NAME[hits[0].piece.toLowerCase()]); } }
+    if(score>0.5) out.push({m,score,san:toSan(state,m),reason:reasons[0]||'builds pressure'}); }
+  out.sort((a,b)=>b.score-a.score); return out.slice(0,3); }
+function gradePrediction(guess,actual){ if(!guess||!actual) return 'miss';
+  if(guess.from===actual.from&&guess.to===actual.to) return 'exact';
+  if(guess.to===actual.to || guess.piece.toLowerCase()===actual.piece.toLowerCase()) return 'idea';
+  return 'miss'; }
+/* end:attackpredict */
+</script>
+
+<script>
+/* ============================================================
    PLAY & COACH  — the flagship. Play the bot; the coach reacts
    to every move: names the opening, assesses, flags mistakes,
    teaches the thinking, and offers a take-back to try again.
    ============================================================ */
 const play={ state:newGame(), youAre:'w', level:STORE.level, history:[], sans:[],
   selected:null, hints:[], lastMove:null, over:false, status:'', lastAnn:null, thinking:false, retryFrom:null,
-  training:STORE.training!==false, pendingBlunder:null, awaitingCatch:null, hintLevel:0, moveStart:null, gameBlunders:0 };
+  training:STORE.training!==false, pendingBlunder:null, awaitingCatch:null, hintLevel:0, moveStart:null, gameBlunders:0,
+  predict:STORE.predict===true, predicting:false, predictMove:null, predictResult:null, predSel:null, predHints:[] };
 
 function newPlayGame(youAre,level){
   play.state=newGame(); play.youAre=youAre; play.level=level; play.history=[]; play.sans=[];
   play.selected=null; play.hints=[]; play.lastMove=null; play.over=false; play.status=''; play.lastAnn=null; play.thinking=false; play.retryFrom=null;
   play.pendingBlunder=null; play.awaitingCatch=null; play.hintLevel=0; play.moveStart=null; play.gameBlunders=0;
+  play.predicting=false; play.predictMove=null; play.predictResult=null; play.predSel=null; play.predHints=[];
   refreshProfile();
   STORE.level=level; persist();
   drawPlay();
@@ -1212,8 +1256,10 @@ function RENDER_play(){
      <div class="field"><label>Opponent strength</label>
        <select class="txt" id="levelPick"></select></div>
      <div class="field"><label>Coaching mode</label>
-       <label style="display:flex;align-items:center;gap:7px;font-size:13.5px;padding:7px 0;cursor:pointer">
-         <input type="checkbox" id="trainToggle" style="width:16px;height:16px;accent-color:var(--accent)"> Blunder-check (stop me before I hang)</label></div>
+       <label style="display:flex;align-items:center;gap:7px;font-size:13px;padding:4px 0;cursor:pointer">
+         <input type="checkbox" id="trainToggle" style="width:16px;height:16px;accent-color:var(--accent)"> Blunder-check (stop me before I hang)</label>
+       <label style="display:flex;align-items:center;gap:7px;font-size:13px;padding:4px 0;cursor:pointer">
+         <input type="checkbox" id="predToggle" style="width:16px;height:16px;accent-color:var(--accent)"> Predict opponent's reply (train anticipation)</label></div>
      <div class="field"><label>&nbsp;</label><button class="btn primary" id="newGameBtn">New game</button></div>
    </div>
    <div class="review-grid">
@@ -1242,6 +1288,8 @@ function RENDER_play(){
   lp.addEventListener('change',()=>{ play.level=+lp.value; STORE.level=play.level; persist(); });
   const tt=$('trainToggle'); tt.checked=play.training;
   tt.addEventListener('change',()=>{ play.training=tt.checked; STORE.training=tt.checked; persist(); play.pendingBlunder=null; drawPlay(); });
+  const pt=$('predToggle'); pt.checked=play.predict;
+  pt.addEventListener('change',()=>{ play.predict=pt.checked; STORE.predict=pt.checked; persist(); });
   $('newGameBtn').addEventListener('click',()=>{ newPlayGame(play.youAre,+lp.value); });
   $('pFlip').addEventListener('click',()=>{ play.youAre=other(play.youAre); drawPlay(); });
   $('pUndo').addEventListener('click',undoPlay);
@@ -1253,14 +1301,17 @@ RENDER.play=RENDER_play;
 
 function drawPlay(){
   const mount=$('playBoard'); if(!mount)return;
-  const humanTurn = !play.over && play.state.turn===play.youAre && !play.thinking;
+  const predicting = play.predicting && !play.over;
+  const humanTurn = !play.over && play.state.turn===play.youAre && !play.thinking && !predicting;
   if(humanTurn && !play.moveStart) play.moveStart=Date.now(); // start the think-timer for this move
-  renderBoard(mount,play.state,{orient:play.youAre,selectable:humanTurn,selected:play.selected,
-    hints:play.hints,lastMove:play.lastMove,onSquare:onPlaySquare});
+  renderBoard(mount,play.state,{orient:play.youAre, selectable: humanTurn||predicting,
+    selected: predicting?play.predSel:play.selected, hints: predicting?play.predHints:play.hints,
+    lastMove:play.lastMove, onSquare: predicting?onPredictSquare:onPlaySquare});
   // status line
   let st=play.status;
-  if(!st){ st = play.over?'Game over.' : play.thinking?'Opponent is thinking…' : (play.state.turn===play.youAre?'Your move.':'Opponent to move.'); }
-  if(inCheck(play.state,play.state.turn) && !play.over) st='Check! '+st;
+  if(predicting) st='Predict: which move will your opponent play?';
+  else if(!st){ st = play.over?'Game over.' : play.thinking?'Opponent is thinking…' : (play.state.turn===play.youAre?'Your move.':'Opponent to move.'); }
+  if(inCheck(play.state,play.state.turn) && !play.over && !predicting) st='Check! '+st;
   $('pStatus').textContent=st;
   drawCoach();
 }
@@ -1297,10 +1348,42 @@ function commitMove(before,m,ann,ms,override,caught){
   play.sans.push(san.replace(/[*+#]/,''));
   play.state=makeMove(before,m); play.lastMove={from:m.from,to:m.to}; play.selected=null; play.hints=[]; play.lastAnn=ann;
   play.retryFrom=(ann.tag==='blunder'||ann.tag==='mistake')? before : null;
-  play.pendingBlunder=null; play.hintLevel=0; play.moveStart=null;
+  play.pendingBlunder=null; play.hintLevel=0; play.moveStart=null; play.predictResult=null;
   const end=checkEnd();
   drawPlay();
-  if(!end && !play.over){ play.thinking=true; drawPlay(); setTimeout(botMove,420); }
+  if(!end && !play.over){
+    if(play.predict) enterPrediction();
+    else { play.thinking=true; drawPlay(); setTimeout(botMove,420); }
+  }
+}
+/* prediction flow: guess the opponent's reply before it's revealed */
+function enterPrediction(){
+  play.predictMove=chooseBotMove(play.state,effectiveLevel(),{prof:PROFILE,sans:play.sans,youAre:play.youAre});
+  if(!play.predictMove){ botMove(); return; }
+  play.predicting=true; play.predictResult=null; play.predSel=null; play.predHints=[]; drawPlay();
+}
+function onPredictSquare(sq){
+  if(!play.predicting||play.over) return; const oppC=play.state.turn, p=play.state.board[sq];
+  if(play.predSel===null){ if(p&&colorOf(p)===oppC){ play.predSel=sq; play.predHints=legalMoves(play.state).filter(m=>m.from===sq).map(m=>m.to); drawPlay(); } return; }
+  if(sq===play.predSel){ play.predSel=null; play.predHints=[]; drawPlay(); return; }
+  if(p&&colorOf(p)===oppC){ play.predSel=sq; play.predHints=legalMoves(play.state).filter(m=>m.from===sq).map(m=>m.to); drawPlay(); return; }
+  const cands=legalMoves(play.state).filter(m=>m.from===play.predSel&&m.to===sq); if(!cands.length){ play.predSel=null; play.predHints=[]; drawPlay(); return; }
+  finishPrediction(cands.find(x=>x.promo==='q')||cands[0]);
+}
+function finishPrediction(guess){
+  const actual=play.predictMove; const grade=gradePrediction(guess,actual);
+  play.predictResult={grade, guessSan: guess?toSan(play.state,guess):null, actualSan: toSan(play.state,actual)};
+  STORE.behavior.moves.push({t:Date.now(),predict:grade,no:Math.floor(play.sans.length/2)+1});
+  if(STORE.behavior.moves.length>800) STORE.behavior.moves=STORE.behavior.moves.slice(-800); persist();
+  play.predicting=false; play.predSel=null; play.predHints=[]; play.thinking=true; drawPlay();
+  setTimeout(applyPredictedBot,750);
+}
+function skipPrediction(){ play.predicting=false; play.predSel=null; play.predHints=[]; play.predictResult=null; play.thinking=true; drawPlay(); setTimeout(applyPredictedBot,250); }
+function applyPredictedBot(){
+  const m=play.predictMove; if(!m){ play.thinking=false; return; } const san=toSan(play.state,m);
+  play.history.push({state:play.state,move:m,san,bot:true}); play.sans.push(san.replace(/[*+#]/,''));
+  play.state=makeMove(play.state,m); play.lastMove={from:m.from,to:m.to}; play.thinking=false; play.predictMove=null;
+  checkEnd(); drawPlay();
 }
 function phaseOf(s){ let n=0; for(const p of s.board) if(p)n++; if(play.sans.length<16) return 'opening'; return n<=12?'endgame':'middlegame'; }
 function logBehaviour(before,m,ann,ms,override,caught){
@@ -1394,6 +1477,19 @@ function drawCoach(){
   const humanNext = !play.over && play.state.turn===play.youAre;
   const assess = play.sans.length? assessPosition(play.state,play.youAre) : null;
   let html='';
+  // prediction: guess the opponent's reply (trains anticipation)
+  if(play.predicting){
+    html+=`<div class="card pad" style="border:1.5px solid var(--info);background:var(--info-soft);margin-bottom:14px">
+      <div style="display:flex;gap:9px;align-items:center;margin-bottom:6px"><span style="font-size:20px">🔮</span><b style="font-family:var(--display);font-size:17px">Predict your opponent's reply</b></div>
+      <div style="font-size:14px">Read the position first: what's their best move here? Tap the piece you think they'll move, then its square.</div>
+      <div class="muted small" style="margin-top:8px">Anticipating the opponent is how you stop walking into their threats.</div>
+      <div class="row" style="margin-top:10px"><button class="btn" id="predSkip">Skip — just show me</button></div></div>`;
+  } else if(play.predictResult){ const r=play.predictResult;
+    const cls=r.grade==='exact'?'right':r.grade==='idea'?'':'wrong';
+    const label=r.grade==='exact'?'Exact — you read it! 🎯':r.grade==='idea'?'Close — right idea':'Not this time';
+    html+=`<div class="verdict ${cls}" style="margin-bottom:14px"><b>${label}</b>
+      <div class="small" style="margin-top:6px">You expected ${r.guessSan?esc(r.guessSan):'—'}; they played <b>${esc(r.actualSan)}</b>.${r.grade!=='exact'?' Ask yourself why — what does that move threaten?':''}</div></div>`;
+  }
   // decision gate — the moment-of-decision intervention
   if(play.pendingBlunder){ const pb=play.pendingBlunder;
     html+=`<div class="card pad" style="border:1.5px solid var(--mistake);background:var(--mistake-soft);margin-bottom:14px">
@@ -1428,6 +1524,20 @@ function drawCoach(){
       <div class="eyebrow" style="color:var(--accent-2)">Your rule to focus on</div>
       <div style="font-weight:600;margin-top:4px">${esc(_rules[0].title)}</div>
       <div class="muted small" style="margin-top:3px">${esc(_rules[0].detail)}</div></div>`;
+  }
+  // Attack radar — what to attack, and how to build the attack
+  if(!play.pendingBlunder && !play.predicting && humanNext && assess){
+    const target=loosestEnemy(play.state,play.youAre), kt=kingTarget(play.state,play.youAre), ideas=attackIdeas(play.state);
+    let weak;
+    if(kt && kt.attackable) weak = kt.castled? ('their king is short of defenders here ('+kt.attackers+' attackers vs '+kt.defenders+')') : 'their king is stuck in the centre — open lines toward it';
+    else if(target) weak = 'their '+PIECE_NAME[target.piece.toLowerCase()]+' on '+sqName(target.sq)+(target.undefended?' is undefended':' is loosely defended');
+    else weak = 'nothing loose yet — improve your worst piece and probe for a target';
+    html+=`<div class="card pad" style="margin-bottom:14px;border-left:4px solid var(--mistake)">
+      <div class="eyebrow" style="color:var(--mistake)">What are you attacking?</div>
+      <div class="small" style="margin-top:5px;line-height:1.6">
+        <div>▸ Their weak point: <b>${weak}</b></div>
+        ${ideas.length?`<div>▸ A way in: <b>${esc(ideas[0].san)}</b> (${esc(ideas[0].reason)})${ideas[1]?`, or <b>${esc(ideas[1].san)}</b>`:''}</div>`:`<div>▸ No forcing shot yet — bring another attacker toward their king before striking.</div>`}
+      </div></div>`;
   }
   // opening chip
   html+=`<div class="card pad" style="margin-bottom:14px">
@@ -1472,6 +1582,7 @@ function drawCoach(){
       <b>${esc(play.status)}</b><div class="small muted" style="margin-top:6px">This game was saved to <b>Your game</b> and its mistakes were added to <b>Puzzles</b>. Hit <b>New game</b> to go again.</div></div>`;
   }
   col.innerHTML=html;
+  const ps=$('predSkip'); if(ps) ps.addEventListener('click',skipPrediction);
   const gl=$('gateLook'); if(gl) gl.addEventListener('click',()=>{ const pb=play.pendingBlunder; if(pb)play.awaitingCatch=pb.ann.category; play.pendingBlunder=null; play.selected=null; play.hints=[]; drawPlay(); });
   const gp=$('gatePlay'); if(gp) gp.addEventListener('click',()=>{ const pb=play.pendingBlunder; if(!pb)return; play.pendingBlunder=null; play.awaitingCatch=null; commitMove(pb.before,pb.move,pb.ann,pb.ms,true,false); });
   const rb=$('retryBtn'); if(rb) rb.addEventListener('click',()=>{
@@ -1596,7 +1707,7 @@ function revealPuzzle(){ if(!puz.cur)return; puz.revealed=true; const m=moveFrom
    Every mode is engine-verified, so it can't train you wrong.
    ============================================================ */
 const train={mode:'tactics'};
-const TRAIN_MODES=[['tactics','Tactics'],['donthang','Don\'t hang'],['mate','Checkmate'],['endgame','Endgames'],['openings','Openings']];
+const TRAIN_MODES=[['tactics','Tactics'],['attack','Attack'],['predict','Predict'],['donthang','Don\'t hang'],['mate','Checkmate'],['endgame','Endgames'],['openings','Openings']];
 function RENDER_train(){
   const P=$('panel-puzzles');
   P.innerHTML=`<div class="section-h"><h2>Train</h2>
@@ -1605,7 +1716,7 @@ function RENDER_train(){
   const mb=$('trainModes');
   TRAIN_MODES.forEach(([v,l])=>{ const b=el('button','pill',l); if(train.mode===v)b.style.borderColor='var(--accent)';
     b.addEventListener('click',()=>{ train.mode=v; RENDER_train(); }); mb.appendChild(b); });
-  ({tactics:renderTactics,donthang:renderDontHang,mate:renderCheckmate,endgame:renderEndgame,openings:renderOpeningTrainer}[train.mode])();
+  ({tactics:renderTactics,attack:renderAttack,predict:renderPredict,donthang:renderDontHang,mate:renderCheckmate,endgame:renderEndgame,openings:renderOpeningTrainer}[train.mode])();
 }
 RENDER.puzzles=RENDER_train;
 
@@ -1789,6 +1900,65 @@ function otGuess(m){ const o=CURATED_OPENINGS[ot.idx]; const want=o.line[ot.ply]
   else { ot.wrong=true; const bm=moveFromSan(ot.state,want[0]); ot.msg='You played '+played+'. The book move is '+want[0]+' — '+want[1];
     if(bm){ ot.state=makeMove(ot.state,bm); ot.last={from:bm.from,to:bm.to}; } ot.ply++; }
   ot.sel=null; ot.hints=[]; otAdvanceOpponent(); drawOT();
+}
+/* ---- Attack & Predict: generated single-move guess drills ---- */
+function selfPlayUntil(pred,tries){ tries=tries||80;
+  for(let t=0;t<tries;t++){ let s=newGame(); const plies=8+((Math.random()*24)|0); let ok=true;
+    for(let i=0;i<plies;i++){ const l=legalMoves(s); if(!l.length){ok=false;break;} const m=chooseBotMove(s,0); if(!m){ok=false;break;} s=makeMove(s,m); }
+    if(!ok||legalMoves(s).length===0) continue; if(pred(s)) return s; }
+  return null; }
+const gm={mode:null,state:null,orient:'w',sol:null,solSan:'',note:'',bestSc:0,sel:null,hints:[],streak:0,best:0,done:false,ok:false,tried:false,revealed:false,last:null};
+const GM={
+  attack:{title:'Attack',intro:'Find the attacking blow — a checkmate or a decisive capture. Trains you to spot the finish. Fresh position every time.',
+    prompt:s=>(s==='w'?'White':'Black')+' to move — find the strongest attacking move.',
+    gen:()=>{ const s=selfPlayUntil(st=>hasMateIn1(st)||sideBestGrab(st).gain>=3,90)||parseFEN('6k1/5ppp/8/8/8/8/8/3R2K1 w - - 0 1');
+      const mate=hasMateIn1(s); if(mate) return {s,sol:mate,note:'Checkmate — the cleanest attack there is.'};
+      const g=sideBestGrab(s); return {s,sol:g.move,note:'A decisive blow — you win '+PIECE_NAME[(s.board[g.move.to]||'p').toLowerCase()]+'.'}; },
+    grade:(s,sol,m)=>{ if(givesMate(s,m))return true; if(m.from===sol.from&&m.to===sol.to)return true;
+      const sn=sol.captured?VAL[sol.captured.toLowerCase()]-seeMax(makeMove(s,sol),sol.to):0;
+      const mn=m.captured?VAL[m.captured.toLowerCase()]-seeMax(makeMove(s,m),m.to):0; return sn>=3?mn>=sn-0.5:false; },
+    tip:'Check every check and every capture near their king first.'},
+  predict:{title:'Predict',intro:'Read the position and predict the strongest move. This is the exact muscle behind anticipating your opponent in a real game.',
+    prompt:s=>(s==='w'?'White':'Black')+' to move — predict the best move.',
+    gen:()=>{ const s=selfPlayUntil(st=>legalMoves(st).length>=6,40)||newGame(); const r=searchRanked(s,2,true);
+      gm.bestSc=r[0].sc; return {s,sol:r[0].m,note:'Strong players would pick '+toSan(s,r[0].m)+' here.'}; },
+    grade:(s,sol,m)=>{ if(m.from===sol.from&&m.to===sol.to)return true; if(m.to===sol.to)return true;
+      const sc=-negamax(makeMove(s,m),2,-1e9,1e9,true); return gm.bestSc-sc<=50; },
+    tip:'Which move is most forcing, improves your worst piece, or grabs the initiative?'}
+};
+function renderAttack(){ gmStart('attack'); }
+function renderPredict(){ gmStart('predict'); }
+function gmStart(mode){ const P=$('trainBody'); if(!P)return; if(gm.mode!==mode){ gm.mode=mode; gm.streak=0; gm.best=0; gm.state=null; }
+  const cfg=GM[mode];
+  P.innerHTML=`<p class="muted small" style="margin:2px 0 12px;max-width:64ch">${cfg.intro}</p>
+   <div class="deckbar"><span class="progress" id="gmProg"></span><span style="flex:1"></span><button class="btn" id="gmReveal">Show answer</button><button class="btn" id="gmNewBtn">New ▸</button></div>
+   <div class="drill-grid"><div><div class="board-wrap" id="gmBoard"></div><div class="side-label" id="gmStatus"></div></div><div id="gmSide"></div></div>`;
+  $('gmReveal').addEventListener('click',gmRevealFn); $('gmNewBtn').addEventListener('click',gmNewFn);
+  if(!gm.state) gmNewFn(); else drawGuess();
+}
+function gmNewFn(){ const g=GM[gm.mode].gen(); gm.state=g.s; gm.orient=g.s.turn; gm.sol=g.sol; gm.solSan=g.sol?toSan(g.s,g.sol):''; gm.note=g.note;
+  gm.sel=null;gm.hints=[];gm.done=false;gm.ok=false;gm.tried=false;gm.revealed=false;gm.last=null; drawGuess(); }
+function gmRevealFn(){ if(!gm.sol)return; gm.revealed=true; gm.done=true; gm.streak=0; gm.last={from:gm.sol.from,to:gm.sol.to}; drawGuess(); }
+function drawGuess(){ const mount=$('gmBoard'); if(!mount)return; const cfg=GM[gm.mode]; const side=gm.state.turn;
+  renderBoard(mount,gm.state,{orient:gm.orient,selectable:!gm.done,selected:gm.sel,hints:gm.hints,lastMove:gm.last,onSquare:gmClick});
+  $('gmProg').textContent=`Streak ${gm.streak} · best ${gm.best}`;
+  $('gmStatus').textContent = gm.done?(gm.ok?'Correct ✓':(gm.revealed?'Answer shown':'Try again')):cfg.prompt(side);
+  let h=`<div class="card pad"><div class="eyebrow">${cfg.title}</div><div style="font-size:15px;margin-top:6px">${esc(cfg.prompt(side))}</div>`;
+  if(gm.done&&gm.ok) h+=`<div class="verdict right" style="margin-top:12px"><b>Correct — ${esc(gm.solSan)} ✓</b><div class="small" style="margin-top:6px">${esc(gm.note)}</div></div><div style="margin-top:12px"><button class="btn primary" id="gmNextBtn">Next ▸</button></div>`;
+  else if(gm.revealed) h+=`<div class="verdict" style="margin-top:12px"><b>Answer: ${esc(gm.solSan)}</b><div class="small" style="margin-top:6px">${esc(gm.note)}</div></div><div style="margin-top:12px"><button class="btn primary" id="gmNextBtn">Next ▸</button></div>`;
+  else if(gm.tried) h+=`<div class="verdict wrong" style="margin-top:12px"><b>Not the best — look again.</b><div class="small muted" style="margin-top:6px">${esc(cfg.tip)}</div></div>`;
+  else h+=`<div class="muted small" style="margin-top:10px">Click a piece, then its target square.</div>`;
+  h+=`</div>`; $('gmSide').innerHTML=h; const n=$('gmNextBtn'); if(n)n.addEventListener('click',gmNewFn);
+}
+function gmClick(sq){ if(gm.done)return; const st=gm.state,side=st.turn,p=st.board[sq];
+  if(gm.sel===null){ if(p&&colorOf(p)===side){ gm.sel=sq;gm.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to);drawGuess(); } return; }
+  if(sq===gm.sel){ gm.sel=null;gm.hints=[];drawGuess();return; }
+  if(p&&colorOf(p)===side){ gm.sel=sq;gm.hints=legalMoves(st).filter(m=>m.from===sq).map(m=>m.to);drawGuess();return; }
+  const cands=legalMoves(st).filter(m=>m.from===gm.sel&&m.to===sq); if(!cands.length){ gm.sel=null;gm.hints=[];drawGuess();return; }
+  const m=cands.find(x=>x.promo==='q')||cands[0]; const ok=GM[gm.mode].grade(st,gm.sol,m); gm.sel=null;gm.hints=[];
+  if(ok){ gm.done=true;gm.ok=true;gm.streak++;gm.best=Math.max(gm.best,gm.streak);gm.last={from:m.from,to:m.to};gm.state=makeMove(st,m); }
+  else gm.tried=true;
+  drawGuess();
 }
 /* end:train */
 </script>
@@ -2034,6 +2204,7 @@ function RENDER_profile(){
     html+=`<div class="card pad" style="margin-bottom:20px"><div class="small" style="line-height:1.7">
       <div>▸ When the coach stopped you, you <b>found a better move ${BR.catches}×</b> and <b>played it anyway ${BR.overrides}×</b>. ${BR.catches>=BR.overrides?'That self-correction is exactly the habit forming — keep it up.':'Try to actually re-look when it stops you, instead of pushing the move through.'}</div>
       ${BR.hintUsed?`<div style="margin-top:5px">▸ You leaned on hints on ${BR.hintUsed} move${BR.hintUsed===1?'':'s'} — try to find the idea first.</div>`:''}
+      ${BR.predict.total?`<div style="margin-top:5px">▸ Opponent-prediction: you read their move <b>${Math.round((BR.predict.exact+BR.predict.idea)/BR.predict.total*100)}%</b> of the time (${BR.predict.exact} exact) over ${BR.predict.total} guesses. Anticipation is climbing.</div>`:''}
       <div style="margin-top:5px">▸ You go wrong most in the ${(['opening','middlegame','endgame'].sort((a,b)=>BR.phase[b]-BR.phase[a])[0])} (${['opening','middlegame','endgame'].map(p=>p+': '+BR.phase[p]).join(', ')}).</div>
     </div></div>`;
   }
@@ -2162,5 +2333,17 @@ initTabs();
 refreshProfile();
 RENDER_play();
 initSync();
+// Installable offline app (PWA): only when served over https off the artifact (e.g. GitHub Pages).
+(function(){ try{
+  if(('claude' in window) || !('serviceWorker' in navigator) || location.protocol!=='https:') return;
+  document.head.insertAdjacentHTML('beforeend',
+    '<link rel="manifest" href="manifest.webmanifest">'+
+    '<link rel="apple-touch-icon" href="icon.svg">'+
+    '<meta name="theme-color" content="#3f7d4e">'+
+    '<meta name="apple-mobile-web-app-capable" content="yes">'+
+    '<meta name="apple-mobile-web-app-title" content="Pawn Coach">'+
+    '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">');
+  navigator.serviceWorker.register('sw.js').catch(function(){});
+}catch(e){} })();
 /* end:boot */
 </script>

@@ -1,0 +1,14 @@
+{
+  "name": "Pawn Coach",
+  "short_name": "Pawn Coach",
+  "description": "An offline chess coach that trains how you think — adaptive play, blunder-check, attack radar, opponent prediction, and drills built from your own mistakes.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#eaeee4",
+  "theme_color": "#3f7d4e",
+  "categories": ["games", "education"],
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

@@ -2,7 +2,9 @@
 
 A pocket chess coach for beginners, built to take you from "can't get past 300" toward real, durable improvement. You **play**, and a coach watches every move: it names the opening you're in, tells you who's better and what to watch for, and when you slip it shows you the *mistake* and *how to think* — not just the engine's move.
 
-**It runs 100% in your browser.** No accounts, no server, no downloads, no API calls, no tracking. The chess engine, the analysis, and your saved games never leave the page. It's a single HTML file with **zero dependencies** — open `index.html` and play, even offline on a plane.
+**It runs 100% in your browser.** No accounts, no server, no API calls, no tracking. The chess engine, the analysis, and your saved games never leave your device. It's a single HTML file with **zero dependencies** — open `index.html` and play, even offline on a plane.
+
+**Install it as a real app.** Served over the web (GitHub Pages) it's a **PWA**: open it on your phone or laptop and use *Add to Home Screen* / *Install* to get an offline, full-screen app icon. Your games, progress and behaviour log **sync across your devices** automatically (see [Sync](#sync-across-your-devices)).
 
 ## What it does
 
@@ -17,9 +19,13 @@ A pocket chess coach for beginners, built to take you from "can't get past 300" 
   - the **opening / variation** you're in, named live ("Italian Game, Giuoco Piano"…),
   - a plain-English **position assessment** — who's ahead and *why*, your development, whether your king is safe, and **what your opponent is threatening right now**,
   - a **"your move" tip** telling you what to think about next (castle now, grab the free piece, meet the threat…),
+  - an **Attack radar** — it names your opponent's weak point (a loose piece, or an exposed king) and shows *a way in*, so you learn to spot targets and build attacks instead of drifting,
+  - an optional **Predict-the-opponent** mode — before the bot replies, you guess its move; you're graded exact / right-idea / miss, which trains the anticipation that stops you walking into threats,
   - if you blunder: the mistake, the **better move**, and the **thinking habit** that would have caught it — plus a one-click **"take it back & try again."**
 - **Train** — a gym of focused drill modes, each one engine-verified so it can never teach you the wrong thing:
   - **Tactics** — a gauntlet of real positions (classic tactics, the mini-games, and **your own mistakes**) with a streak counter and **spaced repetition**: positions you miss come back until you've solved them twice, and your current weakness is served first.
+  - **Attack** — an endless stream of positions where a finishing blow exists (a mate or a decisive capture). Trains you to *see the attack* and convert it.
+  - **Predict** — read a fresh position and predict the strongest move. This is the exact skill behind anticipating an opponent in a real game.
   - **Don't hang** — an *infinite* generator of fresh middlegame positions; just make a move that doesn't let your opponent win material. Instant pass/fail, build a streak. This drills the single habit that decides games under 800.
   - **Checkmate** — learn to actually force mate with **King + Queen vs King** and **King + Rook vs King**. The lone king runs; you corner and mate it (and it warns you about stalemate). Most sub-800 players can't do this reliably — now you will.
   - **Endgames** — **King + Pawn vs King**: escort your pawn home and promote it while the enemy king tries to stop you. Teaches king activity and opposition.
@@ -38,9 +44,7 @@ A pocket chess coach for beginners, built to take you from "can't get past 300" 
 
 ## Sync across your devices
 
-Open the **published version** on your Claude account (phone *and* laptop) and your games, puzzle progress, and stats **sync automatically** across them — powered by the artifact's private per-account storage, still with no API keys and no third-party service. A small badge in the corner shows `☁ synced` when it's on, or `● this device` when you're running the raw file offline.
-
-When you open `index.html` directly (offline, or from this repo), everything still works and saves to your browser's `localStorage` — private to that device.
+Open the **published Claude version** on your account (phone *and* laptop) and your games, puzzle progress, behaviour log and adaptive difficulty **sync automatically** across them — powered by that page's private per-account storage, with no API keys and no third-party service. A small badge in the corner shows `☁ synced` when it's on, or `● this device` when you're running the raw file / installed PWA. The installable PWA (GitHub Pages) and the raw file save to that device's `localStorage`; the Claude version is the one that syncs across devices.
 
 ## The engine
 
